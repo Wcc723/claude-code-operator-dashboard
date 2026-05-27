@@ -4,6 +4,7 @@ import { createWriteStream, mkdirSync, existsSync } from 'node:fs';
 import { resolve, dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { EventEmitter } from 'node:events';
+import { tlog, tstart, recordPtyChunk, endPtyStats } from './trace.js';
 
 const RING_MAX = 2000;
 
@@ -92,23 +93,33 @@ export class TerminalManager {
   }
 
   async spawn({ profile_id }) {
+    const spawnTrace = tstart('spawn');
+    tlog('spawn', `→ profile_id=${profile_id}`);
+
     const profile = this.profiles.get(profile_id);
     if (!profile) {
+      tlog('spawn', `✗ profile ${profile_id} not found`);
       const err = new Error(`launch profile not found: ${profile_id}`);
       err.status = 404;
       throw err;
     }
+    tlog('spawn', `profile loaded`, { name: profile.name, command: profile.command.slice(0, 80), cwd: profile.cwd });
 
     const id = randomUUID();
     const cwd = expandHome(profile.cwd);
+    const cwdT = tstart('spawn');
     if (!existsSync(cwd)) {
+      tlog('spawn', `✗ cwd does not exist: ${cwd}`);
       const err = new Error(`cwd does not exist: ${cwd}`);
       err.status = 422;
       throw err;
     }
+    cwdT.end({ stage: 'cwd-exists-check' });
 
     const logPath = join(this.logDir, `${id}.log`);
+    const logT = tstart('spawn');
     const logStream = createWriteStream(logPath, { flags: 'a' });
+    logT.end({ stage: 'createWriteStream' });
 
     const safeEnv = Object.fromEntries(
       SAFE_ENV_KEYS
@@ -125,11 +136,14 @@ export class TerminalManager {
     // encoding: null → onData 回 Buffer，整條路（log / ring / SSE base64）
     // 都不做 string 解碼，避免 multi-byte UTF-8（box drawing、emoji、ellipsis 等）
     // 被截 byte。xterm.js 端自己會做 UTF-8 + ANSI escape 的跨 chunk 拼接。
+    tlog('spawn', `→ pty.spawn ${this.shell} -i -c ...`);
+    const ptyT = tstart('spawn');
     const ptyProcess = pty.spawn(
       this.shell,
       ['-i', '-c', profile.command],
       { name: 'xterm-256color', cols: 120, rows: 30, cwd, env, encoding: null }
     );
+    ptyT.end({ stage: 'pty.spawn-call', pid: ptyProcess.pid });
 
     const emitter = new EventEmitter();
     emitter.setMaxListeners(50); // 允許多個 SSE client 同時訂閱
@@ -159,9 +173,21 @@ export class TerminalManager {
       _killing: false,
     };
 
+    let firstChunkLogged = false;
     ptyProcess.onData(chunk => {
       // chunk 此處保證是 Buffer（spawn 時 encoding: null）
-      logStream.write(chunk);
+      if (!firstChunkLogged) {
+        firstChunkLogged = true;
+        tlog('pty', `${id.slice(0, 8)} first chunk ${chunk.length} bytes`);
+      }
+      recordPtyChunk(id, chunk.length);
+
+      const ok = logStream.write(chunk);
+      // backpressure 偵測：write 回 false 代表 stream buffer 滿，下次 write 前要等 'drain'
+      if (!ok) {
+        tlog('pty', `⚠️  ${id.slice(0, 8)} logStream backpressure (buffer full)`);
+      }
+
       record.output_ring.push(chunk);
       if (record.output_ring.length > RING_MAX) {
         record.output_ring.splice(0, record.output_ring.length - RING_MAX);
@@ -170,6 +196,8 @@ export class TerminalManager {
     });
 
     ptyProcess.onExit(({ exitCode, signal }) => {
+      tlog('pty', `${id.slice(0, 8)} exit code=${exitCode} signal=${signal ?? '-'}`);
+      endPtyStats(id);
       record.status = 'exited';
       record.exited_at = new Date().toISOString();
       record.exit_code = signal ? `signal:${signal}` : exitCode;
@@ -180,6 +208,7 @@ export class TerminalManager {
     });
 
     this.sessions.set(id, record);
+    spawnTrace.end({ id: id.slice(0, 8), pid: ptyProcess.pid, totalSessions: this.sessions.size });
     return this._toJson(record);
   }
 

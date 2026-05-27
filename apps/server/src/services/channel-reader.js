@@ -2,6 +2,7 @@ import { readdir, readFile, writeFile, stat, rename } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join, resolve, basename, dirname } from 'node:path';
 import matter from 'gray-matter';
+import { tlog, tstart } from './trace.js';
 
 export const IDENTITY_FILES = [
   'CLAUDE.md',
@@ -91,15 +92,23 @@ export class ChannelReader {
   }
 
   async listAgents() {
+    const T = tstart('listAgents');
     const dir = this._agentsDir();
-    if (!existsSync(dir)) return [];
+    if (!existsSync(dir)) { T.end({ n: 0, reason: 'no-dir' }); return []; }
+    const filesT = tstart('listAgents');
     const files = (await readdir(dir)).filter(f => f.endsWith('.md'));
+    filesT.end({ stage: 'readdir', n: files.length });
     const agents = [];
+    let slowestMs = 0;
+    let slowestFile = '';
     for (const file of files) {
       const full = join(dir, file);
+      const fT = tstart('listAgents');
       const raw = await readFile(full, 'utf8');
       const parsed = matter(raw);
       const st = await stat(full);
+      const ms = fT.elapsed();
+      if (ms > slowestMs) { slowestMs = ms; slowestFile = file; }
       agents.push({
         name: parsed.data.name ?? basename(file, '.md'),
         slug: basename(file, '.md'),
@@ -114,6 +123,10 @@ export class ChannelReader {
         mtime: st.mtimeMs,
       });
     }
+    if (slowestMs > 100) {
+      tlog('listAgents', `⚠️  slowest file ${slowestFile} took ${slowestMs.toFixed(0)}ms`);
+    }
+    T.end({ n: files.length, slowestMs: slowestMs.toFixed(0) });
     return agents.sort((a, b) => a.slug.localeCompare(b.slug));
   }
 

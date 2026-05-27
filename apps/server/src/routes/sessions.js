@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { execFile } from 'node:child_process';
+import { tlog } from '../services/trace.js';
 
 // AppleScript 字串內的 " 要轉成 \" ，\ 要轉成 \\
 function escapeAS(s) {
@@ -62,6 +63,7 @@ export function sessionsRouter(terminal) {
 
     // 1) catch-up：先把 ring buffer 既有內容推給 client
     const catchUp = terminal.logFull(id);
+    tlog('sse', `→ open ${id.slice(0, 8)} catchUp=${catchUp ? catchUp.length : 0}B listeners=${session._emitter?.listenerCount?.('data') ?? '?'}`);
     if (catchUp) sendData(catchUp);
 
     // 2) subscribe live stream
@@ -73,6 +75,7 @@ export function sessionsRouter(terminal) {
         setTimeout(() => res.end(), 1000);
       },
     });
+    tlog('sse', `subscribed ${id.slice(0, 8)} now listeners=${session._emitter?.listenerCount?.('data')}`);
 
     // 3) keep-alive ping
     const pingInterval = setInterval(() => {
@@ -83,6 +86,7 @@ export function sessionsRouter(terminal) {
     req.on('close', () => {
       clearInterval(pingInterval);
       unsubscribe?.();
+      tlog('sse', `✗ close ${id.slice(0, 8)} now listeners=${session._emitter?.listenerCount?.('data')}`);
     });
   });
 

@@ -25,6 +25,7 @@ import { identityRouter } from './routes/identity.js';
 import { statusRouter } from './routes/status.js';
 import { launchProfilesRouter } from './routes/launch-profiles.js';
 import { sessionsRouter } from './routes/sessions.js';
+import { tracePlatformInfo, tracePtyBinding, startLagMonitor, requestTraceMiddleware, tlog } from './services/trace.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT ?? 3000);
@@ -52,6 +53,8 @@ const authGate = new AuthGate({
 
 const app = express();
 app.disable('x-powered-by');
+// 效能追蹤：印每個 request 進入 / 完成 / 耗時。第一個 middleware 才能涵蓋全部
+app.use(requestTraceMiddleware);
 app.use(express.json({ limit: '2mb' }));
 app.use(cookieParser());
 
@@ -117,10 +120,15 @@ app.use((err, req, res, next) => {
   res.status(status).json(body);
 });
 
-const server = app.listen(PORT, HOST, () => {
+const server = app.listen(PORT, HOST, async () => {
   console.log(`[codd-server] listening on http://${HOST}:${PORT}`);
   console.log(`[codd-server] channel: ${reader.root}`);
   console.log(`[codd-server] db: ${resolve(dbPath)}`);
+  // 效能追蹤啟動
+  tracePlatformInfo({ port: PORT, host: HOST, channelPath: reader.root });
+  await tracePtyBinding();
+  startLagMonitor();
+  tlog('boot', 'trace ready — 用 CODD_TRACE=0 可關閉');
 });
 
 // 讓 keep-alive 連線立刻收到 FIN 而不是等到 idle，避免 port 卡 TIME_WAIT
