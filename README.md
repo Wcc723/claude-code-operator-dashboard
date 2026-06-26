@@ -15,6 +15,72 @@
 
 ## 架構
 
+npm workspaces monorepo（`apps/server` + `apps/web` + `apps/mcp`），對外只開一個 Cloudflare named tunnel，Google ID Token 認證；附一個 stdio MCP server 讓 channel 內的 Claude Code agent 自助查平台資料。下圖為整體元件與資料流：
+
+```mermaid
+flowchart TB
+  Operator["營運者 / 瀏覽器"]
+  Google["Google Identity Services"]
+  CF["Cloudflare Named Tunnel — HTTPS"]
+
+  subgraph WEB["apps/web — Vite + Vue 3 SPA"]
+    Views["Views: Identity · Skills · Agents · Tasks<br/>Memory · Kanban · Sessions · Profiles"]
+    Pulse["StatusPulse 元件"]
+    Term["SessionDetail — xterm.js + SSE"]
+    Api["api.js · auth store"]
+  end
+
+  subgraph SRV["apps/server — Express"]
+    Gate["AuthGate (protect)<br/>Google ID token 驗簽 + session JWT cookie"]
+    Routes["REST Routes<br/>auth · skills · agents · tasks · memory<br/>identity · kanban · launch-profiles · sessions · status"]
+    CR["ChannelReader"]
+    KR["KanbanRepo"]
+    LPR["LaunchProfileRepo"]
+    TM["TerminalManager — node-pty"]
+  end
+
+  subgraph MCP["apps/mcp — stdio MCP server (codd-manager)"]
+    Tools["read skills · agents · tasks · memory<br/>+ kanban CRUD + schemas"]
+  end
+
+  subgraph DATA["資料層"]
+    DB[("SQLite — kanban.db<br/>launch_profiles · kanban · revoked_sessions")]
+    FS["Channel 檔案系統<br/>.claude/skills · .claude/agents<br/>tasks · memory · IDENTITY 系列"]
+    ST["codd-status/*.json"]
+    PTY["PTY 進程: claude CLI + session logs"]
+  end
+
+  subgraph CH["Channel — 一個 Claude Code 專案"]
+    Agent["Claude Code Agent"]
+    Hook["PostToolUse status-writer hook"]
+  end
+
+  Operator -->|HTTPS| CF --> Gate
+  Operator -.->|登入取得 ID token| Google
+  Gate -.->|verifyIdToken| Google
+  Views --> Api
+  Pulse --> Api
+  Term --> Api
+  Api --> Gate --> Routes
+  Routes --> CR
+  Routes --> KR
+  Routes --> LPR
+  Routes --> TM
+  CR --> FS
+  KR --> DB
+  LPR --> DB
+  TM -->|spawn · SSE · stdin| PTY
+  PTY -->|執行| Agent
+  Agent -->|stdio 呼叫| Tools
+  Tools --> FS
+  Tools --> DB
+  Agent --> Hook --> ST
+  Routes -.->|/status 讀取並疊加心跳| ST
+  SRV -.->|production 服務 web/dist| WEB
+```
+
+### 目錄結構
+
 ```
 2026-remote-claude-code-manager/
 ├── apps/
@@ -26,6 +92,36 @@
 │   └── google-oauth-setup.md
 ├── .env.example
 └── README.md
+```
+
+### 即時終端機資料流（PTY ↔ SSE ↔ xterm.js）
+
+Sessions 模組把一個 launch profile 在後端 spawn 成 PTY（跑 `claude`），輸出走 SSE 推到瀏覽器的 xterm.js，鍵盤輸入則走 POST 回寫 PTY stdin；DELETE 為 soft-delete（從預設列表移除，filter 可顯示）。
+
+```mermaid
+sequenceDiagram
+  actor U as 瀏覽器 xterm.js
+  participant S as Express · /api/terminal/sessions
+  participant TM as TerminalManager
+  participant P as PTY · claude CLI
+
+  U->>S: POST /sessions { profile_id }
+  S->>TM: spawn(profile)
+  TM->>P: pty.spawn(shell -ic "claude")
+  S-->>U: 201 { id, status: running }
+
+  U->>S: GET /:id/stream (SSE)
+  S->>TM: subscribe + flush ring buffer
+  P-->>TM: onData(raw bytes)
+  TM-->>S: emit "data"
+  S-->>U: event:data (base64) ⇒ term.write
+
+  U->>S: POST /:id/input { data: base64 }
+  S->>TM: write(bytes)
+  TM->>P: pty.write → stdin
+
+  U->>S: DELETE /:id (soft-delete)
+  S->>TM: remove() ⇒ kill + removed=true
 ```
 
 ## 安裝
