@@ -14,6 +14,9 @@ import { KanbanRepo } from './services/kanban-repo.js';
 import { AuthGate } from './services/auth-gate.js';
 import { LaunchProfileRepo } from './services/launch-profile-repo.js';
 import { TerminalManager } from './services/terminal-manager.js';
+import { SessionInsights } from './services/session-insights.js';
+import { resolveStatusDir } from './services/status-paths.js';
+import { SystemSampler } from './services/system-stats.js';
 
 import { authRouter } from './routes/auth.js';
 import { skillsRouter } from './routes/skills.js';
@@ -25,6 +28,8 @@ import { identityRouter } from './routes/identity.js';
 import { statusRouter } from './routes/status.js';
 import { launchProfilesRouter } from './routes/launch-profiles.js';
 import { sessionsRouter } from './routes/sessions.js';
+import { systemRouter } from './routes/system.js';
+import { setupRouter } from './routes/setup.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT ?? 3000);
@@ -41,6 +46,9 @@ const terminal = new TerminalManager({
   profiles: profileRepo,
   logDir: resolve(__dirname, '../data/sessions'),
 });
+const statusDir = resolveStatusDir();
+const insights = new SessionInsights({ statusDir });
+const sampler = new SystemSampler({ terminal });
 const authGate = new AuthGate({
   clientId: process.env.GOOGLE_CLIENT_ID,
   allowedEmail: process.env.ALLOWED_EMAIL,
@@ -89,9 +97,11 @@ app.use('/api/tasks', protect, tasksRouter(reader));
 app.use('/api/memory', protect, memoryRouter(reader));
 app.use('/api/kanban', protect, kanbanRouter(repo));
 app.use('/api/identity', protect, identityRouter(reader));
-app.use('/api/status', protect, statusRouter(terminal));
+app.use('/api/status', protect, statusRouter(terminal, insights));
 app.use('/api/launch-profiles', protect, launchProfilesRouter(profileRepo));
-app.use('/api/terminal/sessions', protect, sessionsRouter(terminal));
+app.use('/api/terminal/sessions', protect, sessionsRouter(terminal, insights));
+app.use('/api/system', protect, systemRouter(sampler, insights));
+app.use('/api/setup', protect, setupRouter({ statusDir, repoRoot: resolve(__dirname, '../../..') }));
 
 if (isProd) {
   const distPath = resolve(__dirname, '../../web/dist');
@@ -123,6 +133,7 @@ const server = app.listen(PORT, HOST, () => {
   console.log(`[codd-server] listening on http://${HOST}:${PORT}`);
   console.log(`[codd-server] channel: ${reader.root}`);
   console.log(`[codd-server] db: ${resolve(dbPath)}`);
+  console.log(`[codd-server] status dir: ${statusDir}`);
 });
 
 // 讓 keep-alive 連線立刻收到 FIN 而不是等到 idle，避免 port 卡 TIME_WAIT
@@ -140,6 +151,8 @@ async function shutdown(signal) {
     console.error('[codd-server] forced exit (shutdown timeout)');
     process.exit(1);
   }, 12000).unref();
+
+  sampler.stop();
 
   // 1. HTTP server：停接新連線、強制斷現有 keep-alive；同時 await 真的關閉
   if (typeof server.closeAllConnections === 'function') {
