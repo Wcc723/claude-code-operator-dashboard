@@ -3,7 +3,8 @@ import { useAuthStore } from './stores/auth.js';
 
 const routes = [
   { path: '/login', name: 'login', component: () => import('./views/LoginView.vue'), meta: { public: true } },
-  { path: '/', redirect: '/identity' },
+  { path: '/', name: 'home', component: () => import('./views/HomeView.vue') },
+  { path: '/setup', name: 'setup', component: () => import('./views/SetupView.vue') },
   { path: '/identity', component: () => import('./views/IdentityList.vue') },
   { path: '/identity/:name', component: () => import('./views/IdentityDetail.vue'), props: true },
   { path: '/skills', component: () => import('./views/SkillsList.vue') },
@@ -16,8 +17,10 @@ const routes = [
   { path: '/memory/:date', component: () => import('./views/MemoryViewer.vue'), props: true },
   { path: '/kanban', component: () => import('./views/KanbanBoard.vue') },
   { path: '/sessions', component: () => import('./views/SessionsList.vue') },
-  { path: '/sessions/:id', component: () => import('./views/SessionDetail.vue'), props: true },
+  // fullBleed：.main 不留 padding、不捲動，交給 SessionDetail 自己填滿
+  { path: '/sessions/:id', name: 'session', component: () => import('./views/SessionDetail.vue'), props: true, meta: { fullBleed: true } },
   { path: '/profiles', component: () => import('./views/LaunchProfilesList.vue') },
+  { path: '/:pathMatch(.*)*', redirect: '/' },
 ];
 
 const router = createRouter({

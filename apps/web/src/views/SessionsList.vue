@@ -2,8 +2,10 @@
 import { ref, onMounted, computed } from 'vue';
 import { useRouter } from 'vue-router';
 import { api } from '../api.js';
+import { useSessionsStore, sessionState, STATE_META } from '../stores/sessions.js';
 
 const router = useRouter();
+const store = useSessionsStore();
 const sessions = ref([]);
 const profiles = ref([]);
 const selectedProfileId = ref(null);
@@ -39,6 +41,7 @@ async function spawn() {
   try {
     await api.spawnSession(selectedProfileId.value);
     await load();
+    store.refresh({ force: true });
   } catch (e) { error.value = e.message; }
   finally { spawning.value = false; }
 }
@@ -47,17 +50,20 @@ async function kill(id) {
   if (!confirm('Kill this session?')) return;
   await api.killSession(id);
   await load();
+  store.refresh({ force: true });
 }
 
 async function restart(id) {
   await api.restartSession(id);
   await load();
+  store.refresh({ force: true });
 }
 
 async function remove(id) {
   if (!confirm('Remove this session from the list? (執行中會先 kill)')) return;
   await api.removeSession(id);
   await load();
+  store.refresh({ force: true });
 }
 
 onMounted(load);
@@ -67,6 +73,10 @@ const indexLabel = computed(() => {
   const running = visibleSessions.value.filter(s => s.status === 'running').length;
   return `INDEX · ${visibleSessions.value.length} sessions · ${running} running`;
 });
+
+function stateOf(s) {
+  return sessionState(s);
+}
 
 function runtime(s) {
   if (!s.started_at) return '—';
@@ -113,9 +123,12 @@ function runtime(s) {
       @keydown.space.prevent="enter(s.id)"
     >
       <div class="row">
-        <strong>{{ s.profile_name }}</strong>
+        <span :class="['lamp', `st-${stateOf(s)}`]">{{ STATE_META[stateOf(s)].glyph }}</span>
+        <strong :title="s.last_prompt ? `最近 prompt：${s.last_prompt}` : undefined">{{ s.title || s.profile_name }}</strong>
         <span class="notice">·  {{ s.id.slice(0, 8) }}</span>
         <span :class="['chip', s.status === 'running' ? 'primary' : 'dim']">{{ s.status }}</span>
+        <span v-if="s.status === 'running' && s.activity" :class="['chip', 'state', `st-${stateOf(s)}`]">{{ STATE_META[stateOf(s)].label }}</span>
+        <span v-if="s.title && s.profile_name" class="chip dim">{{ s.profile_name }}</span>
         <span v-if="s.removed" class="chip dim">removed</span>
         <span class="chip">pid: {{ s.pid }}</span>
         <span class="chip">run: {{ runtime(s) }}</span>
@@ -125,7 +138,10 @@ function runtime(s) {
         <button @click.stop="restart(s.id)">RESTART</button>
         <button v-if="!s.removed" @click.stop="remove(s.id)" class="danger">REMOVE</button>
       </div>
-      <div class="meta">→ <code>{{ s.command }}</code></div>
+      <div class="meta">
+        <span v-if="s.cwd_short || s.cwd" class="cwd">{{ s.cwd_short || s.cwd }}</span>
+        → <code>{{ s.command }}</code>
+      </div>
     </div>
   </div>
 </template>
@@ -160,4 +176,13 @@ function runtime(s) {
 .chip.primary { background: var(--success); border-color: var(--success); color: #000; }
 .chip.dim { color: var(--dim); }
 .spacer { flex: 1; }
+.lamp { width: 12px; text-align: center; font-size: 12px; }
+.st-waiting { color: var(--amber); }
+.st-busy { color: var(--success); }
+.st-idle { color: var(--cyan); }
+.st-unknown { color: var(--bone); }
+.st-ended { color: var(--dimmer); }
+.chip.state { border-color: currentColor; text-transform: uppercase; }
+.chip.state.st-waiting { background: var(--amber); border-color: var(--amber); color: #000; }
+.cwd { color: var(--dim); margin-right: 10px; }
 </style>

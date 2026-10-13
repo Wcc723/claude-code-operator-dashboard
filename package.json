@@ -16,7 +16,8 @@
     "start": "npm --workspace apps/server run start",
     "mcp": "npm --workspace apps/mcp run start",
     "tunnel": "cloudflared tunnel --config configs/cloudflared.yml run",
-    "channel": "node scripts/channel-cli.js"
+    "channel": "node scripts/channel-cli.js",
+    "setup": "node scripts/setup-cli.js"
   },
   "devDependencies": {
     "npm-run-all": "^4.1.5"

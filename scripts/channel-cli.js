@@ -58,9 +58,13 @@ function getFlag(name) {
   return argv[i + 1];
 }
 
-function shouldRun(module) {
-  if (!flags.only.length) return true;
-  return flags.only.includes(module);
+// hooks 模組已由 user-level 的 `npm run setup` 取代：channel 級 PostToolUse hook 會和它重複觸發，
+// 所以 install / update 預設跳過，只有明確 --only hooks 才會動（uninstall / status 照常，方便清掉舊的）
+const SUPERSEDED = new Set(['hooks']);
+
+function shouldRun(module, cmd) {
+  if (flags.only.length) return flags.only.includes(module);
+  return !(SUPERSEDED.has(module) && (cmd === 'install' || cmd === 'update'));
 }
 
 // ───────── env / paths ─────────
@@ -340,7 +344,11 @@ const modules = { hooks, agents, mcp };
 function runCommand(cmd) {
   const results = {};
   for (const [name, mod] of Object.entries(modules)) {
-    if (!shouldRun(name)) { results[name] = { action: 'skip', reason: '--only filter' }; continue; }
+    if (!shouldRun(name, cmd)) {
+      const reason = flags.only.length ? '--only filter' : 'superseded by `npm run setup`';
+      results[name] = { action: 'skip', reason };
+      continue;
+    }
     try { results[name] = mod[cmd](); }
     catch (e) { results[name] = { action: 'error', reason: e.message }; }
   }
