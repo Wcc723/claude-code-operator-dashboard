@@ -25,6 +25,8 @@ const FIRST_PROMPT_MAX = 60;
 const STATES = new Set(['busy', 'waiting', 'idle', 'ended']);
 const REASONS = new Set(['permission', 'question', 'plan']);
 const REGISTRY_STATES = new Set(['busy', 'idle', 'waiting']);
+// registry 的 'shell' = 閒置但有背景工作（Claude 在輸入提示等使用者）→ 當 idle
+const REGISTRY_ALIASES = new Map([['shell', 'idle']]);
 // hook 漏掉的轉換（核准權限、Esc 中斷、turn 中 compact）只靠 registry 修正，而且只往 busy / idle 修：
 // waiting 是最吵的狀態，只信 hook。差距要超過這個值才算「registry 比較新」，避開兩邊同時寫的競態
 const REGISTRY_RECONCILE_TO = new Set(['busy', 'idle']);
@@ -425,6 +427,11 @@ export class SessionInsights {
   async _registryMatch(rec, claudeSessionId, configDir = null) {
     const homes = [this.claudeHome];
     if (configDir && configDir !== this.claudeHome) homes.push(configDir);
+    // TerminalManager.resolveLive(…, { requireMcp }) 帶的內部欄位：profile env 換了 CLAUDE_CONFIG_DIR、又沒裝 hook 時，
+    // 只有從這裡才找得到該 session 的 registry
+    const ptyDir = typeof rec._claude_config_dir === 'string' && isAbsolute(rec._claude_config_dir)
+      ? resolve(rec._claude_config_dir) : null;
+    if (ptyDir && !homes.includes(ptyDir)) homes.push(ptyDir);
     for (const home of homes) {
       const items = await this._loadRegistry(join(home, 'sessions'));
       const hit = items.find(e => (Number.isInteger(rec.pid) && e.pid === rec.pid)
@@ -452,7 +459,7 @@ export class SessionInsights {
         items = all.filter(Boolean).map(o => ({
           pid: Number.isInteger(o.pid) ? o.pid : null,
           sessionId: str(o.sessionId),
-          status: str(o.status),
+          status: REGISTRY_ALIASES.get(str(o.status)) ?? str(o.status),
           statusUpdatedAt: o.statusUpdatedAt ?? o.updatedAt ?? null,
         }));
       } catch {}

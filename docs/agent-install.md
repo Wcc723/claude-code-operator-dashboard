@@ -26,7 +26,7 @@ agent 要在 repo 裡才讀得到這份文件，所以這幾步由人類先做�
    - 「你有 Cloudflare 帳號，而且有一個網域已經加進去、狀態是 Active 嗎？」沒有的話給兩個選擇：(a) 先暫停，等人類把網域加進 Cloudflare、改好 nameserver、dashboard 顯示 Active（可能要等幾小時）再繼續；(b) 只在主機本機使用：不設 `TUNNEL_HOSTNAME`，步驟 4 的 origin 改填 `http://localhost:<PORT>` 與 `http://localhost`，跳過步驟 8、9，步驟 12 在主機上用 Chrome 開 `http://localhost:<PORT>`。之後要對外時再補做步驟 8、9，並把 hostname 加進 OAuth origins。
 2. **只向人類要只有他能給的東西**（見下表），其餘自己做、自己驗證。同一步需要的值一次問完。
 3. **寫入 repo 以外的位置之前，先取得人類同意。** 包含：安裝工具（Homebrew、`brew install`、`uv tool install`、`npm install -g`、`curl … | sh` 這類安裝程式，先列出要裝的全部項目，一次取得同意）、`~/.zshrc` 等 shell 設定檔、`~/Library/LaunchAgents/`（步驟 6）、`~/.claude/settings.json` 與 `<CHANNEL_PATH>/.claude/settings.json`（步驟 7，後者是 legacy 清除）、CHANNEL_PATH 裡的其他檔案（步驟 11）、任何 `sudo`、Cloudflare 帳號上的資源。能 dry-run 的先 dry-run，把結果摘要給人類看。repo 內的 `.env`、`configs/cloudflared.yml`、`apps/web/dist`、`apps/server/data/` 可以直接寫。
-4. **不要顯示任何秘密。** 不要 `cat .env`，不要印出 `SESSION_SECRET`（直接產生並寫進 `.env`）。不要讀或印 `~/.codex/auth.json`、`~/.claude.json`、`~/.cloudflared/`、`/etc/cloudflared/`、`~/.fancy-codd/`。檢查 `.env` 一律用步驟 0 的檢查程式（只印狀態與 hostname，不印秘密值）。
+4. **不要顯示任何秘密。** 不要 `cat .env`，不要印出 `SESSION_SECRET`（直接產生並寫進 `.env`）。不要讀或印 `~/.codex/auth.json`、`~/.claude.json`、`~/.cloudflared/`、`/etc/cloudflared/`、`~/.fancy-codd/`，也不要讀或印 `apps/server/data/mcp-host-token` 與 `apps/server/data/mcp/` 裡的 `.json`（artifact MCP 的 bearer token，只能看是否存在與權限）。檢查 `.env` 一律用步驟 0 的檢查程式（只印狀態與 hostname，不印秘密值）。
    - Cloudflare tunnel token 不要讓人類貼進對話，也不要直接打在指令列（會留在 `~/.zsh_history`）。人類在 dashboard 複製 token 後，自己在主機終端機執行 `sudo cloudflared service install "$(pbpaste)"`。
    - 用 token 安裝的 cloudflared 服務會把 token 放在 `/Library/LaunchDaemons/com.cloudflare.cloudflared.plist` 的 ProgramArguments，也會出現在 `launchctl print system/com.cloudflare.cloudflared` 與 `ps` 的指令列。不要 `cat`、`plutil -p`、`grep` 這個 plist，不要執行 `launchctl print system/com.cloudflare.cloudflared`，不要 `ps aux | grep cloudflared`（改用 `pgrep -x cloudflared`）。檢查服務只用 `ls` 與 `sudo launchctl list | grep cloudflared`，排錯只看 `/Library/Logs/com.cloudflare.cloudflared.err.log`（另有 `.out.log`）。
 5. **絕對不要執行**：`cswap switch|add|remove|run|purge`、`codex login`（請人類自己做）、`codex logout`（會到 OpenAI 撤銷登入，帳號庫裡存的副本跟著失效）、`cloudflared tunnel delete`，也不要刪除 `apps/server/data/` 或任何 settings 備份。
@@ -53,6 +53,7 @@ agent 要在 repo 裡才讀得到這份文件，所以這幾步由人類先做�
 | Cloudflare dashboard 建 tunnel、自己執行 `sudo cloudflared service install "$(pbpaste)"` | Tunnel | 9 |
 | `cswap add`、`codex login`（選用） | 用量面板 | 10 |
 | 用瀏覽器登入 CODD、開 session、送一句 prompt | 驗收 | 12 |
+| 在 CODD 開的 session 請 Claude 發布一個 artifact，再開它給的連結（選用） | 驗收 Artifact | 12 |
 
 ## 步驟 0：偵測現況（唯讀）
 
@@ -138,7 +139,7 @@ case "$H" in ""|*example.com) echo "external health: skip（TUNNEL_HOSTNAME 未�
 | `external health: 502` | server 沒在跑或 Tunnel 指到錯的 port：步驟 6、步驟 9 的「失敗時」 |
 | `external health: 530`（頁面顯示 1033） | connector 沒連上：步驟 9 的「失敗時」 |
 | `external health:` 是 `302`、`skip` 以外的其他值 | 步驟 9 的「失敗時」 |
-| 以上全部通過（`external health: 302`，或只在本機使用時為 `skip`） | 步驟 12，然後問人類要不要做 10、11 |
+| 以上全部通過（`external health: 302`，或只在本機使用時為 `skip`） | 步驟 12，然後問人類要不要做 10、11 與步驟 12 的「選用：Artifact」 |
 
 步驟 9 只看外部檢查：`cloudflared service`、`configs/cloudflared.yml` 這些檔案存在不代表 tunnel 有通，也可能是別條 tunnel 留下的。
 
@@ -241,7 +242,8 @@ setenv TUNNEL_HOSTNAME "<hostname>"     # 只在本機使用時刪掉這行（�
 | `PORT` | 預設 3000 | 被別的程式佔用就換一個，Tunnel 的目標要跟著改 |
 | `HOST` | 預設 `127.0.0.1` | 不要改 |
 | `SESSION_TTL_DAYS` | 預設 7 | 登入有效天數 |
-| `TUNNEL_HOSTNAME` | hostname | 程式不讀取，但本手冊以它為準：步驟 0 用它做外部檢查，步驟 8、9、12 的 `<hostname>` 都是它。只在本機使用時不設 |
+| `TUNNEL_HOSTNAME` | hostname | 本手冊以它為準：步驟 0 用它做外部檢查，步驟 8、9、12 的 `<hostname>` 都是它。server 也用它組 artifact 連結（沒設 `CODD_PUBLIC_URL` 時是 `https://<hostname>/artifact/<id>`）。只在本機使用時不設，並把 `.env` 裡範例的 `TUNNEL_HOSTNAME=codd.example.com` 刪掉或註解掉（步驟 0 會把範例值當成未設，server 組連結時則會照用） |
+| `CODD_PUBLIC_URL`、`CODD_ARTIFACTS_MCP`、`CODD_ARTIFACTS_AUTO_ALLOW`、`CODD_ARTIFACT_NOTIFY_UNKNOWN`、`CODD_ARTIFACT_MAX_BYTES` | 不用設 | Artifact 的選填設定，預設值就能用。說明見 [README 的 Artifact 段](../README.md#設定env皆選填) |
 | `CSWAP_BIN`、`CODEX_BIN`、`CODEX_HOME`、`CODD_CODEX_VAULT` | 步驟 10 | 選填 |
 | `CLAUDE_CONFIG_DIR` | 預設 `~/.claude` | 只有人類本來就用自訂 Claude 設定目錄時才設；會傳給 session，步驟 7 也會改裝到 `$CLAUDE_CONFIG_DIR/settings.json` |
 | `VITE_GOOGLE_CLIENT_ID` | 不要設 | 前端與 server 必須用同一個 Client ID（server 只認 `GOOGLE_CLIENT_ID` 為 audience），設成不同值會登入 401 `Wrong recipient` |
@@ -291,12 +293,12 @@ npm run build                             # 產生 apps/web/dist
 grep -lF "$(grep -E '^GOOGLE_CLIENT_ID=' .env | cut -d= -f2)" apps/web/dist/assets/*.js   # 有印出檔名 = Client ID 已編進前端
 ```
 
-試跑用 `.env` 的設定與真正的資料庫，但 port 從 3901 開始找一個沒人用的（環境變數優先於 `.env`），不會撞到已經在跑的 CODD 或人類的 dev server。這是 AGENTS.md「臨時測試用別的 port 與暫存資料庫」的例外：這裡要確認的就是真正的設定能啟動。
+試跑用 `.env` 的設定與真正的資料庫，但 port 從 3901 開始找一個沒人用的（環境變數優先於 `.env`），不會撞到已經在跑的 CODD 或人類的 dev server。這是 AGENTS.md「臨時測試用別的 port 與暫存資料庫」的例外：這裡要確認的就是真正的設定能啟動。session log 與 artifact MCP 設定檔的目錄（`CODD_DATA_DIR`）改用暫存的：server 啟動時會清掉那裡殘留的 MCP 設定檔，用真正的目錄會清到正在跑的 CODD 發給 session 的那些。
 
 ```bash
 SMOKE=3901; while lsof -nP -iTCP:"$SMOKE" -sTCP:LISTEN >/dev/null; do SMOKE=$((SMOKE+1)); done
 LOG="${TMPDIR:-/tmp}/codd-smoke.log"
-PORT=$SMOKE node apps/server/src/index.js > "$LOG" 2>&1 & PID=$!
+PORT=$SMOKE CODD_DATA_DIR="${TMPDIR:-/tmp}/codd-smoke-data" node apps/server/src/index.js > "$LOG" 2>&1 & PID=$!
 for i in 1 2 3 4 5 6 7 8 9 10; do curl -fsS --max-time 1 "http://127.0.0.1:$SMOKE/api/health" 2>/dev/null && break; sleep 1; done; echo
 curl -s -o /dev/null -w 'GET / -> %{http_code}\n' "http://127.0.0.1:$SMOKE/"
 kill $PID; wait $PID 2>/dev/null; cat "$LOG"
@@ -556,6 +558,42 @@ node scripts/channel-cli.js status
 
 資料庫預設的 project `claude-station`（指令帶 Discord channel plugin、資料夾 `~/Claude-station`）不一定適用，開不起來時到 PROJECTS 改掉即可。
 
+### 選用：Artifact
+
+CODD 開的 Claude session 會自動掛上 artifact 工具（HTTP MCP `codd-artifacts`，說明見 [README 的 Artifact 段](../README.md#artifacthtml-頁面與設計畫布)），不需要另外安裝。這裡確認它有開起來。
+
+- **需要人類**：開 session、請 Claude 發布、開連結都由人類在瀏覽器做。agent 不要自己開 session，也不要帶 token 呼叫 `/api/mcp`（規則 4）。
+- 前提：上面的 #5、#6 已通過；要收到提交通知，步驟 7 的 hooks 要裝好。
+
+agent 先在主機上跑（唯讀；不帶 token，所以預期是 401）：
+
+```bash
+PORT=$(grep -E '^PORT=' .env | cut -d= -f2); PORT=${PORT:-3000}
+curl -s -o /dev/null -w '/api/mcp -> %{http_code}\n' "http://127.0.0.1:$PORT/api/mcp"
+test -f apps/server/data/mcp-host-token && stat -f 'host token mode %Lp' apps/server/data/mcp-host-token || echo "host token: none"
+grep -F '[codd-server] artifacts:' ~/Library/Logs/fancy-codd-server.log | tail -1
+```
+
+| # | 誰 | 檢查 | 預期 |
+|---|---|---|---|
+| A1 | agent | 上面的指令 | `/api/mcp -> 401`、`host token mode 600`；log 那行是 `https://<hostname>/artifacts（MCP on）`（只在本機使用時是 `http://localhost:<PORT>/artifacts`） |
+| A2 | 人類 | 從 CODD 開一個指令是 `claude` 的 session，送：「用 artifact_create 發布一個 html artifact，標題叫『測試』，內容是一個按鈕」 | Claude 直接呼叫工具，終端機沒有跳出權限詢問；回覆一個 `https://<hostname>/artifact/<id>` 連結 |
+| A3 | 人類 | 開那個連結（手機或其他電腦也行） | 登入後看到那個按鈕；側欄 ARTIFACTS 有這一筆，來源是剛才的 session |
+| A4 | 人類（可選） | 在頁面按「留言」、點按鈕寫一句，再按「提交」 | Claude 閒置時，session 出現一行 `[CODD] artifact「測試」(<id>) 收到第 1 次提交…`，Claude 接著呼叫 `artifact_read_submissions`；頁面的「紀錄」顯示「已通知」 |
+
+- **失敗時**：
+
+| 看到 | 原因與處理 |
+|---|---|
+| `/api/mcp -> 404`，log 那行是 `MCP off` | `.env` 有 `CODD_ARTIFACTS_MCP=0`；或 log 有 `artifact MCP disabled`，代表 `apps/server/data/` 寫不進去（看權限、磁碟空間）。修好後請人類同意再重啟 |
+| `/api/mcp -> 404`，log 沒有 `artifacts:` 那行 | server 還在跑更新前的程式。請人類同意後重啟（步驟 6 的「日常操作」，會結束所有 session） |
+| `/api/mcp -> 403` | 請求帶了轉送 header 或不是本機直連，例如 shell 設了 `http_proxy`，curl 經過了 proxy。這個檢查一定要在主機上直接打 `127.0.0.1`（必要時加 `--noproxy '*'`），不要經過 tunnel |
+| Claude 說沒有 `artifact_create` 這類工具 | session 是在 server 更新前開的（重開 session）；project 的指令不是單純的 `claude …`，例如開頭是別的指令、包了一層腳本，或含有 `;`、`&&`、`\|`、`<`、`>`、`#`、`$(`、結尾是 `\`（請人類到 PROJECTS 改成單純的 `claude …`，其他設定放到 project 的 env）；或 `.env` 有 `CODD_ARTIFACTS_MCP=0` |
+| 呼叫 artifact 工具仍然跳出權限詢問 | project 的指令自己已經帶 `--settings`：CODD 為了不蓋掉它，就不加自動允許的設定。請人類在那份 settings 的 `permissions.allow` 加上 `"mcp__codd-artifacts"`，或在詢問時選允許。其他原因：`.env` 有 `CODD_ARTIFACTS_AUTO_ALLOW=0`，或人類的 settings 有 deny 規則 |
+| 提交後 session 沒出現 `[CODD]` 那行 | 看頁面「紀錄」的通知狀態。「等 session 閒置」：Claude 正在忙、或停在權限確認或選單，閒置後才會送（最多等 30 分鐘），這是預期行為。Claude 明明閒著卻一直是「等 session 閒置」，最後變成「等太久，沒有通知」：hooks 沒裝或沒作用（回步驟 7，`setup-cli status` 要是 `complete`），CODD 判斷不出 session 狀態就不送；`CODD_ARTIFACT_NOTIFY_UNKNOWN=1` 可以改成照送，但 Claude 停在選單時打進去的字會被當成選擇，要人類自己決定。「session 已結束」：在頁面按「接手…」交給另一個 session。不管哪種，提交都已保存，在 session 裡請 Claude 用 `artifact_read_submissions` 讀即可 |
+| Claude 給的連結是 `http://localhost:…`（而人類要從外面開） | `.env` 沒有 `TUNNEL_HOSTNAME`，也沒有 `CODD_PUBLIC_URL`。用步驟 3 的 `setenv TUNNEL_HOSTNAME "<hostname>"`（或 `setenv CODD_PUBLIC_URL "https://<hostname>"`），請人類同意後重啟。已經給出的連結把前面換成 `https://<hostname>` 就能開，路徑 `/artifact/<id>` 不變 |
+| Claude 給的連結是 `https://codd.example.com/…` | `.env` 的 `TUNNEL_HOSTNAME` 還是範例值（步驟 0 把它當成未設，server 組連結時照用）。對外使用就改成真正的 hostname；只在本機使用就把那行刪掉或註解掉，連結會變成 `http://localhost:<PORT>/…`。改完請人類同意後重啟 |
+
 ## 疑難排解
 
 | 症狀 | 原因與處理 |
@@ -582,3 +620,4 @@ node scripts/channel-cli.js status
 | 升級 Node 後 statusline 顯示 `outdated` 或 node 不存在 | 用新的 node 重跑步驟 7 的 `install`，plist 的 node 也要換（步驟 6） |
 | 面板顯示「安裝 cswap 才能切換帳號」，終端機明明有 cswap | 滑鼠移上去看提示：「找不到 cswap」代表 launchd 的 PATH 沒有它，「CSWAP_BIN 指到的 cswap 不存在」代表 `CSWAP_BIN` 寫錯。設好 `CSWAP_BIN`（Codex 對應 `CODEX_BIN`）並重啟 |
 | log 出現 `Operation not permitted` | macOS 隱私權限制，見步驟 6 的失敗處理 |
+| Artifact：Claude 沒有 `artifact_create` 工具、仍跳權限詢問、提交後沒收到 `[CODD]` 通知、連結是 `localhost` 或 `codd.example.com` | 見步驟 12「選用：Artifact」的失敗處理 |

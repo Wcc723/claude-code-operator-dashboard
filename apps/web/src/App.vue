@@ -10,12 +10,14 @@ import SetupGuide from './components/SetupGuide.vue';
 import { colorHex, colorMeta } from './colors.js';
 import { stationTabOf, stationTabLabel } from './station.js';
 
-// 側欄只留兩個入口（原本的 WORKSPACE 群組）：
-// PROJECTS = 開 session 用的設定；STATION = channel 根目錄的 IDENTITY / SKILLS / … 合成一頁（見 station.js）。
+// 側欄入口（原本的 WORKSPACE 群組）：
+// PROJECTS = 開 session 用的設定；STATION = channel 根目錄的 IDENTITY / SKILLS / … 合成一頁（見 station.js）；
+// ARTIFACTS = Claude 透過 CODD 的 artifact MCP 發布的 HTML / 畫布。
 // ALL SESSIONS 移到 SessionSidebar 的標題列。/station 會 redirect 回上次看的分頁
 const NAV = [
   { to: '/projects', label: 'PROJECTS', section: 'projects' },
   { to: '/station', label: 'STATION', section: 'station' },
+  { to: '/artifacts', label: 'ARTIFACTS', section: 'artifacts' },
 ];
 
 const route = useRoute();
@@ -24,6 +26,8 @@ const auth = useAuthStore();
 const store = useSessionsStore();
 
 const isLogin = computed(() => route.name === 'login');
+// /artifact/:id：整頁只有 artifact（沒有側欄、手機 top bar），登入檢查照舊由 router 處理
+const standalone = computed(() => !!route.meta.standalone);
 const fullBleed = computed(() => !!route.meta.fullBleed);
 const mainEl = ref(null);
 
@@ -44,6 +48,7 @@ const pageLabel = computed(() => {
   if (route.name === 'session') return currentSession.value?.title || currentSession.value?.profile_name || 'SESSION';
   if (route.name === 'setup') return 'SETUP';
   if (route.meta.section === 'projects') return 'PROJECTS';
+  if (route.meta.section === 'artifacts') return 'ARTIFACTS';
   if (route.meta.section === 'station') {
     const tab = stationTabLabel(stationTabOf(route));
     return tab ? `STATION · ${tab}` : 'STATION';
@@ -57,6 +62,11 @@ watch(() => auth.user, (user) => {
   if (user) store.start();
   else store.stop();
 }, { immediate: true });
+
+// standalone（artifact 檢視）不疊 CRT 掃描線與暗角：設計稿要看到原本的顏色
+watchEffect(() => {
+  document.body.classList.toggle('codd-standalone', standalone.value && !!auth.user);
+});
 
 watchEffect(() => {
   const n = store.waitingCount;
@@ -145,6 +155,9 @@ async function logout() {
   <div v-if="isLogin">
     <RouterView />
   </div>
+  <div v-else-if="auth.user && standalone" class="standalone-shell">
+    <RouterView />
+  </div>
   <div
     v-else-if="auth.user"
     class="app-shell"
@@ -222,7 +235,35 @@ async function logout() {
   </div>
 </template>
 
+<style>
+/* body::before / ::after 是 styles.css 的 CRT 掃描線與暗角（蓋在整個畫面最上層）；artifact 檢視頁關掉 */
+body.codd-standalone::before,
+body.codd-standalone::after {
+  display: none;
+}
+</style>
+
 <style scoped>
+/* standalone 頁面（/artifact/:id）：跟 .app-shell 一樣固定在 visual viewport 內（--app-h / --app-top），
+   iOS 軟鍵盤彈出時整頁縮到鍵盤上方；頁面自己決定內部怎麼捲動 */
+.standalone-shell {
+  position: fixed;
+  left: 0;
+  right: 0;
+  top: var(--app-top, 0px);
+  height: 100vh;
+  height: var(--app-h, 100dvh);
+  overflow: hidden;
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
+  display: flex;
+  flex-direction: column;
+}
+.standalone-shell > :deep(*) {
+  flex: 1;
+  min-height: 0;
+}
+
 /* PROJECTS / STATION：沿用 styles.css 的 .ws（上方虛線分隔）與 .nav（連結樣式）；
    .nav 的 padding 會蓋掉 .ws 的 padding-top，這裡補回來 */
 .ws.nav {

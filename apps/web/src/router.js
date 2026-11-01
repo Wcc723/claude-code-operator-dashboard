@@ -38,6 +38,14 @@ const routes = [
   { path: '/memory/:date', redirect: (to) => ({ name: 'station-memory', params: { date: to.params.date } }) },
   { path: '/kanban', redirect: '/station/kanban' },
 
+  // ───── ARTIFACTS：CODD 托管的 HTML / 畫布 ─────
+  // 列表在一般版面；檢視頁是 standalone（App.vue 不畫側欄與手機 top bar，整頁給 artifact）。
+  // 對外網址是 /artifact/:id（單數，MCP 回給 Claude 的 url 就是這個）；/artifacts/:id 也導過去
+  { path: '/artifacts', name: 'artifacts', component: () => import('./views/ArtifactsList.vue'), meta: { section: 'artifacts' } },
+  { path: '/artifact/:id', name: 'artifact', component: () => import('./views/ArtifactView.vue'), props: true, meta: { standalone: true } },
+  { path: '/artifacts/:id', redirect: (to) => ({ name: 'artifact', params: { id: to.params.id }, query: to.query }) },
+  { path: '/artifact', redirect: '/artifacts' },
+
   { path: '/sessions', component: () => import('./views/SessionsList.vue') },
   // fullBleed：.main 不留 padding、不捲動，交給 SessionDetail 自己填滿
   { path: '/sessions/:id', name: 'session', component: () => import('./views/SessionDetail.vue'), props: true, meta: { fullBleed: true } },

@@ -66,26 +66,59 @@ const CLAUDE_CMD_RE = /^\s*claude(\s*$|\s+['"-])/;
 const SESSION_FLAG_RE = /(^|\s)(-c|-r|--continue|--resume|--session-id|--fork-session)(\s|=|$)/;
 // 換行 = 另一條指令、# = 後面接的 flag 會被當註解吃掉，這兩種也不能直接往後接
 const SHELL_CONTROL_RE = /[;&|<>`\n\r#]|\$\(/;
+// profile 自己帶了 --settings：再接一個會把它蓋掉（後面的贏），這時不接 CODD 的權限設定
+const SETTINGS_FLAG_RE = /(^|\s)--settings(\s|=|$)/;
+
+// 互動式 `claude …` 指令：可以安全地往後接 flag 的形式（沒有 shell 控制字元、結尾不是續行的 \\）
+export function isInteractiveClaude(command) {
+  const cmd = String(command ?? '');
+  return CLAUDE_CMD_RE.test(cmd)
+    && !SHELL_CONTROL_RE.test(cmd)
+    && !cmd.trimEnd().endsWith('\\');
+}
+
+// 單引號包起來給 shell：' → '\''
+function shellQuote(s) {
+  return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
 
 // 單純的 `claude …` 指令就帶 --session-id（PTY id 兼任 Claude session id），
 // 之後不靠 hook 也能從 transcript 找到這個 session 的標題。
 // 已指定續接 / fork 的、或含 shell 控制字元（往後接 flag 會接錯位置）的一律不動。
-export function buildSpawnCommand(command, id) {
+// 有 mcpConfigPath 時再接 --mcp-config（CODD 的 artifact MCP）：-c / --resume 也接（跟 --session-id 不同），
+// 一定放在最後面，因為 --mcp-config 吃多個值，放在 prompt 前面會把 prompt 當成設定檔。
+// 有 settingsPath（自動允許 mcp__codd-artifacts 的權限設定檔）時，在 --mcp-config 前面接 --settings；
+// profile 自己已經有 --settings 就不接（只略過這一段，--mcp-config 照接）。
+export function buildSpawnCommand(command, id, { mcpConfigPath, settingsPath } = {}) {
   const cmd = String(command ?? '');
-  const trimmed = cmd.trimEnd();
-  const linkable = CLAUDE_CMD_RE.test(cmd)
-    && !SESSION_FLAG_RE.test(cmd)
-    && !SHELL_CONTROL_RE.test(cmd)
-    && !trimmed.endsWith('\\');
-  if (!linkable) return { command: cmd, claude_session_id: null };
-  return { command: `${trimmed} --session-id ${id}`, claude_session_id: id };
+  if (!isInteractiveClaude(cmd)) return { command: cmd, claude_session_id: null, mcp: false };
+  const linkSession = !SESSION_FLAG_RE.test(cmd);
+  const mcp = typeof mcpConfigPath === 'string' && mcpConfigPath.length > 0;
+  if (!linkSession && !mcp) return { command: cmd, claude_session_id: null, mcp: false };
+  let out = cmd.trimEnd();
+  if (linkSession) out += ` --session-id ${id}`;
+  if (mcp) {
+    if (typeof settingsPath === 'string' && settingsPath.length > 0 && !SETTINGS_FLAG_RE.test(cmd)) {
+      out += ` --settings ${shellQuote(settingsPath)}`;
+    }
+    out += ` --mcp-config ${shellQuote(mcpConfigPath)}`;
+  }
+  return { command: out, claude_session_id: linkSession ? id : null, mcp };
+}
+
+function expandConfigDir(v) {
+  if (typeof v !== 'string' || !v.trim()) return null;
+  const p = expandHome(v.trim());
+  return p.startsWith('/') ? resolve(p) : null;
 }
 
 export class TerminalManager {
-  constructor({ profiles, logDir, shell = process.env.SHELL || '/bin/zsh' }) {
+  // mcp：McpTokens（CODD artifact MCP）或 null。null 時 spawn 行為與沒有這個功能時完全相同
+  constructor({ profiles, logDir, shell = process.env.SHELL || '/bin/zsh', mcp = null }) {
     this.profiles = profiles;
     this.logDir = resolve(logDir);
     this.shell = shell;
+    this.mcp = mcp || null;
     this.sessions = new Map();
     mkdirSync(this.logDir, { recursive: true });
 
@@ -96,6 +129,8 @@ export class TerminalManager {
       for (const s of this.sessions.values()) {
         if (s.status === 'running' && s._pty) {
           try { s._pty.kill('SIGTERM'); } catch {}
+          // 設定檔裡有 token：同步刪掉（漏掉的下次啟動由 McpTokens.cleanupStale() 清）
+          if (s._mcp) this._revokeMcp(s.id);
         }
       }
     });
@@ -189,16 +224,42 @@ export class TerminalManager {
       cols: clampDim(cols, COLS_MIN, COLS_MAX, DEFAULT_COLS),
       rows: clampDim(rows, ROWS_MIN, ROWS_MAX, DEFAULT_ROWS),
     };
-    const spawnCmd = buildSpawnCommand(profile.command, id);
+    // 互動式 claude 才發 artifact MCP 的 token + 設定檔（token 只在設定檔裡，不進 env、不進 record）。
+    // 發不出來（例如磁碟問題）就照舊開 session，只是沒有 artifact 工具
+    let mcpConfigPath = null;
+    let settingsPath = null;
+    if (this.mcp && isInteractiveClaude(profile.command)) {
+      try {
+        mcpConfigPath = this.mcp.issue(id).configPath;
+      } catch (e) {
+        console.error('[terminal] artifact MCP config not issued:', e?.code || e?.message);
+      }
+      // 自動允許 artifact 工具的權限設定檔（CODD_ARTIFACTS_AUTO_ALLOW=0 時回 null）。寫不出來就照舊，只是每次要按同意
+      if (mcpConfigPath && typeof this.mcp.ensureSettings === 'function') {
+        try {
+          settingsPath = this.mcp.ensureSettings();
+        } catch (e) {
+          console.error('[terminal] artifact MCP settings not written:', e?.code || e?.message);
+        }
+      }
+    }
+    const spawnCmd = buildSpawnCommand(profile.command, id, { mcpConfigPath, settingsPath });
 
     // encoding: null → onData 回 Buffer，整條路（log / ring / SSE base64）
     // 都不做 string 解碼，避免 multi-byte UTF-8（box drawing、emoji、ellipsis 等）
     // 被截 byte。xterm.js 端自己會做 UTF-8 + ANSI escape 的跨 chunk 拼接。
-    const ptyProcess = pty.spawn(
-      this.shell,
-      ['-i', '-c', spawnCmd.command],
-      { name: 'xterm-256color', cols: size.cols, rows: size.rows, cwd, env, encoding: null }
-    );
+    let ptyProcess;
+    try {
+      ptyProcess = pty.spawn(
+        this.shell,
+        ['-i', '-c', spawnCmd.command],
+        { name: 'xterm-256color', cols: size.cols, rows: size.rows, cwd, env, encoding: null }
+      );
+    } catch (e) {
+      if (mcpConfigPath) this._revokeMcp(id);
+      try { logStream.end(); } catch {}
+      throw e;
+    }
 
     const emitter = new EventEmitter();
     emitter.setMaxListeners(50); // 允許多個 SSE client 同時訂閱
@@ -226,6 +287,8 @@ export class TerminalManager {
       rows: size.rows,
       controller_client_id: null,
       claude_session_id: spawnCmd.claude_session_id,
+      // restart() 後指向接手的新 session id（resolveLive 沿這條鏈找還活著的那個）
+      replaced_by: null,
       // 標記色：開的時候繼承 project（launch profile）的預設色，之後可以各自改（setColor）
       color: sanitizeColor(profile.color),
       log_path: logPath,
@@ -236,6 +299,10 @@ export class TerminalManager {
       _emitter: emitter,
       _exitPromise: exitPromise,
       _killing: false,
+      // 有沒有掛上 artifact MCP（只記布林；token / 設定檔路徑不放 record）
+      _mcp: spawnCmd.mcp,
+      // 這個 PTY 實際的 CLAUDE_CONFIG_DIR（profile env 可以換掉）：只給 artifact 通知查 session registry 用，不進 API
+      _claude_config_dir: expandConfigDir(env.CLAUDE_CONFIG_DIR),
     };
 
     ptyProcess.onData(chunk => {
@@ -261,6 +328,7 @@ export class TerminalManager {
       record.exit_code = signal ? `signal:${signal}` : exitCode;
       record._pty = null;
       try { logStream.end(); } catch {}
+      if (record._mcp) this._revokeMcp(id);
       emitter.emit('exit', { exitCode, signal });
       resolveExit({ exitCode, signal });
     });
@@ -318,7 +386,33 @@ export class TerminalManager {
     // 重開的 session 留在原本的位置，標記色也沿用舊的（包括「已清掉顏色」的 null，不重新繼承 project 色）
     freshRec.order = s.order;
     freshRec.color = sanitizeColor(s.color);
+    s.replaced_by = fresh.id;
     return this._toJson(freshRec);
+  }
+
+  // 沿著 restart 留下的 replaced_by 找到還在跑的那個 session（最多走 20 層）；找不到回 null。
+  // requireMcp：給 artifact 通知用（會往 PTY 打字）。鏈上每一個（含最後活著的那個）都要是掛了 artifact MCP 的
+  // 互動式 claude，否則回 null：restart 會用 profile「現在」的指令重開，可能已經改成 bash / codex，不能往裡面打字。
+  // 這時回傳值另外帶內部欄位 _claude_config_dir（給 insights 找 session registry；不會出現在 API）
+  resolveLive(id, { requireMcp = false } = {}) {
+    if (typeof id !== 'string' || !id) return null;
+    let cur = this.sessions.get(id);
+    for (let hops = 0; cur && hops <= 20; hops++) {
+      if (requireMcp && cur._mcp !== true) return null;
+      if (cur.status === 'running' && cur._pty) {
+        if (!requireMcp) return this._toJson(cur);
+        return { ...this._toJson(cur), _claude_config_dir: cur._claude_config_dir ?? null };
+      }
+      if (!cur.replaced_by) return null;
+      cur = this.sessions.get(cur.replaced_by);
+    }
+    return null;
+  }
+
+  _revokeMcp(id) {
+    try { this.mcp?.revoke(id); } catch (e) {
+      console.error('[terminal] artifact MCP revoke failed:', e?.code || e?.message);
+    }
   }
 
   // 標記色：color = palette key 或 null（清除）。不合法的值 throw（err.status = 400），不會默默清掉顏色。
@@ -389,7 +483,8 @@ export class TerminalManager {
     await Promise.all(tasks);
   }
 
-  // 白名單輸出：內部欄位（_emitter / _exitPromise / log_path 等）不外流到 API
+  // 白名單輸出：內部欄位（_emitter / _exitPromise / log_path / _mcp 等）不外流到 API；
+  // artifact MCP 的 token 與設定檔路徑本來就不在 record 裡
   _toJson(s) {
     return {
       id: s.id,

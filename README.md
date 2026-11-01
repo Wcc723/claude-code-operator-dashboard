@@ -10,6 +10,7 @@
 | 📁 Projects | 開 session 的設定（資料夾 + 指令 + env），可設預設標記色，新開的 session 會繼承 |
 | 🛰️ Station | 常駐 agent 的基地台：Identity / Skills / Agents / Tasks / Memory / Kanban 合在一頁，用分頁切換 |
 | 📊 用量與帳號 | 側欄底部顯示 Claude（cswap）與 Codex 的週用量，可展開看所有帳號並一鍵切換 |
+| 🖼️ Artifacts | Claude 透過 CODD 發布的 HTML 頁面與設計畫布，從 `/artifact/<id>` 開，不受 Claude 帳號切換影響；可留言、作答、貼便利貼、標「選這個」，提交後自動通知原 session |
 | 📚 Skills | 列出 `$CHANNEL_PATH/.claude/skills/*/SKILL.md`，可線上編輯 frontmatter + body |
 | 🤖 Agents | 列出 `.claude/agents/*.md`，可編輯 |
 | ⏰ Tasks | 列出 `tasks/*.md`，可編輯 cron / prompt（不重啟 cron） |
@@ -19,7 +20,7 @@
 
 ## 架構
 
-npm workspaces monorepo（`apps/server` + `apps/web` + `apps/mcp`），對外只開一個 Cloudflare named tunnel，Google ID Token 認證；附一個 stdio MCP server 讓 channel 內的 Claude Code agent 自助查平台資料。下圖為整體元件與資料流：
+npm workspaces monorepo（`apps/server` + `apps/web` + `apps/mcp`），對外只開一個 Cloudflare named tunnel，Google ID Token 認證；附一個 stdio MCP server 讓 channel 內的 Claude Code agent 自助查平台資料，另外 server 本身提供只收本機連線的 HTTP MCP `codd-artifacts`，讓 CODD 開的 session 發布 [artifact](#artifacthtml-頁面與設計畫布)。下圖為整體元件與資料流：
 
 ```mermaid
 flowchart TB
@@ -28,7 +29,7 @@ flowchart TB
   CF["Cloudflare Named Tunnel — HTTPS"]
 
   subgraph WEB["apps/web — Vite + Vue 3 SPA"]
-    Views["Views: Projects · Sessions<br/>Station（Identity · Skills · Agents · Tasks · Memory · Kanban）"]
+    Views["Views: Projects · Sessions · Artifacts<br/>Station（Identity · Skills · Agents · Tasks · Memory · Kanban）"]
     Pulse["DeviceStatus + UsagePanel（主機狀態、帳號用量與切換）"]
     Term["SessionDetail — xterm.js + SSE"]
     Api["api.js · auth store"]
@@ -36,11 +37,13 @@ flowchart TB
 
   subgraph SRV["apps/server — Express"]
     Gate["AuthGate (protect)<br/>Google ID token 驗簽 + session JWT cookie"]
-    Routes["REST Routes<br/>auth · skills · agents · tasks · memory<br/>identity · kanban · launch-profiles · sessions · status"]
+    Routes["REST Routes<br/>auth · skills · agents · tasks · memory<br/>identity · kanban · launch-profiles · sessions · status · artifacts"]
     CR["ChannelReader"]
     KR["KanbanRepo"]
     LPR["LaunchProfileRepo"]
     TM["TerminalManager — node-pty"]
+    AMCP["codd-artifacts（HTTP MCP · /api/mcp）<br/>bearer token，只收本機直連"]
+    AR["ArtifactRepo · ArtifactNotifier"]
   end
 
   subgraph MCP["apps/mcp — stdio MCP server (codd-manager)"]
@@ -48,7 +51,7 @@ flowchart TB
   end
 
   subgraph DATA["資料層"]
-    DB[("SQLite — kanban.db<br/>launch_profiles · kanban · revoked_sessions")]
+    DB[("SQLite — kanban.db<br/>launch_profiles · kanban · revoked_sessions · artifacts")]
     FS["Channel 檔案系統<br/>.claude/skills · .claude/agents<br/>tasks · memory · IDENTITY 系列"]
     ST["codd-status/*.json"]
     PTY["PTY 進程: claude CLI + session logs"]
@@ -78,6 +81,9 @@ flowchart TB
   Agent -->|stdio 呼叫| Tools
   Tools --> FS
   Tools --> DB
+  Routes --> AR
+  Agent -->|HTTP MCP，per-session token| AMCP --> AR --> DB
+  AR -.->|提交通知：session 閒置時打一行| TM
   Agent --> Hook --> ST
   Routes -.->|/status 讀取並疊加心跳| ST
   SRV -.->|production 服務 web/dist| WEB
@@ -217,6 +223,99 @@ npm run tunnel    # cloudflared 起 named tunnel（需先按 configs/cloudflared
 - 任何 API 回應、log、錯誤訊息都不含 token；畫面預設只顯示 alias 或遮罩過的 email（完整 email 只在滑鼠提示裡）。
 - server 可能由 launchd 啟動、PATH 不完整，所以會依序找 `CSWAP_BIN` / `CODEX_BIN` → PATH → `~/.local/bin` → `/opt/homebrew/bin` → `/usr/local/bin`（Codex 另找 Codex.app / ChatGPT.app 內附的 CLI）。其他選填環境變數見 `.env.example`（`CODEX_HOME`、`CODD_CODEX_VAULT`）。
 
+## Artifact（HTML 頁面與設計畫布）
+
+Claude Code 內建的 Artifact 工具發布到 claude.ai，跟著當下登入的 Claude 帳號走；用 `cswap` 切換帳號後，之前發布的頁面常常讀不到。所以 CODD 自己托管 artifact：Claude 在 CODD 開的 session 裡發布，內容存在主機的 SQLite（同一個 `kanban.db`），從 `https://<對外網址>/artifact/<id>` 開，手機或其他電腦都行。跟其他頁面一樣要先登入 CODD（Cloudflare Access + Google 登入）。側欄的 **ARTIFACTS** 列出所有 artifact，可以改名、刪除（soft delete），也能只看某個 session 建立的。
+
+| 種類 | 內容 | 適合 |
+|---|---|---|
+| **html** | 單一 HTML 頁面 | 報告、互動小工具、表單。頁面可以呼叫 `window.codd.submit(data)`，把任意 JSON（≤ 256 KiB）放進回覆並打開提交視窗 |
+| **canvas** | 設計畫布：多個 HTML 設計稿（frame，1–24 個）、問答卡（單選 / 複選 / 填空，最多 30 張）、說明卡（最多 30 張）。可平移縮放 | 比較方案、請你挑一個、收集設計回饋 |
+
+### Claude 怎麼拿到工具
+
+不用另外設定。CODD 開 session 時，只要 project 的指令是互動式 `claude …`（以 `claude` 開頭，沒有 `;`、`&&`、`|`、`<`、`>`、`#`、`$(` 這類 shell 控制字元，結尾也不是 `\`；`-c`、`--resume` 也算），就在指令最後面自動加上：
+
+| 參數 | 內容 |
+|---|---|
+| `--mcp-config apps/server/data/mcp/<session id>.json` | 掛上 HTTP MCP server `codd-artifacts`（`http://127.0.0.1:<PORT>/api/mcp`），帶這個 session 專屬的 bearer token。token 只存在 server 記憶體與這個 0600 的設定檔，session 結束就撤銷並刪檔，server 重啟後全部失效 |
+| `--settings apps/server/data/mcp/codd-artifacts.settings.json` | 內容只有 `permissions.allow: ["mcp__codd-artifacts"]`（不含 token），Claude 呼叫 artifact 工具時不必每次在終端機按同意。profile 指令自己已經有 `--settings` 時不加（避免蓋掉你的設定）；你的 settings 裡的 deny 規則仍然優先 |
+
+- 不想要時：`CODD_ARTIFACTS_MCP=0` 完全不掛（spawn 指令跟沒有這個功能時一樣，已發布的 artifact 仍然看得到）；`CODD_ARTIFACTS_AUTO_ALLOW=0` 照掛，但不帶 `--settings`，工具照 Claude Code 原本的權限設定詢問。改了要重啟 server。
+- codex 或其他指令開的 session 不會掛。已經在跑的 session 不會補掛，要重開。
+- MCP 的 instructions 會請 Claude 優先用 CODD 的工具，但不封鎖內建的 Artifact 工具。
+- 這跟下面「接 MCP 進你的 channel」的 `codd-manager`（stdio）是兩個不同的 MCP server。
+
+| Tool | 用途 |
+|---|---|
+| `artifact_create` | 發布新的 artifact：`kind: "html"` 給 `html`，`kind: "canvas"` 給 `canvas`。回傳 `{ id, kind, title, version, url }`，Claude 會把 url 給你。頁面已經寫成檔案時可以用 `html_path`（這個 session 工作目錄底下的 `.html` / `.htm`）代替 `html` |
+| `artifact_update` | 發布新版本（version +1），或只給 `title` 只改名。只能改這個 session 建立的（restart 後接手的 session 也算）。canvas 沒改的 frame 只給 id 就沿用原本的 HTML |
+| `artifact_get` | 讀內容與狀態：指定版本的 HTML 或 canvas、版本列表、提交數、未讀數、你有沒有還沒提交的草稿（`has_draft`） |
+| `artifact_list` | 列出 artifact（新到舊）；`this_session_only: true` 只列這個 session 建立的 |
+| `artifact_read_submissions` | 讀你提交的回饋：每次提交一段 Markdown 摘要，最後附完整 JSON。預設只回未讀的並標成已讀 |
+
+HTML 必須自成一體：CSS / JS 內嵌或從 https CDN 載入，不能 fetch / XHR / WebSocket 連網，不能引用相對路徑的資源，也不能用 cookie / localStorage。單一 artifact 預設上限 3 MiB（canvas 算整個 spec 的 JSON），單一 frame 的 HTML 上限 1.5 MiB。
+
+### 回饋流程
+
+1. Claude 用 `artifact_create` 發布，把 url 給你。
+2. 你在 `/artifact/<id>` 上回覆。回覆是草稿，自動存在 server，換一台裝置打開還在：
+   - **留言**：切到「留言」模式，點頁面上任何元素，留言會釘在那裡，並附上被點到的元素（標籤、class、文字、selector、位置）。「清單」列出所有留言。
+   - **問答**（canvas）：直接在問答卡上作答。
+   - **便利貼**（canvas）：切到「便利貼」模式，點畫布任意處貼一張，可以拖曳、換色。
+   - **選這個**（canvas）：在 frame 標題列按 ★「選這個」，標出喜歡的方案。
+3. 按「提交」，可以附一段「給 Claude 的話」，預設勾選「提交後通知 session」。
+4. CODD 在建立這個 artifact 的 session 終端機打一行固定格式的通知，再按 Enter：
+
+   ```text
+   [CODD] artifact「<標題>」(<id>) 收到第 <n> 次提交，請用 artifact_read_submissions 讀取後依回饋處理。
+   ```
+
+   只在 session **閒置**時送（CODD 的 hooks 或 Claude Code 自己的 session 紀錄回報 idle）。Claude 忙碌、停在權限確認或選單時先排隊，閒置後才送，免得打進去的字和 Enter 被當成選擇；最多等 30 分鐘。沒裝 hooks、又找不到 session 紀錄時，CODD 判斷不出狀態，預設不送（見下面的 `CODD_ARTIFACT_NOTIFY_UNKNOWN`）。session 已經結束、等太久，或你取消勾選時都不送，但提交一定會保存，Claude 之後用 `artifact_read_submissions` 讀得到。
+5. Claude 呼叫 `artifact_read_submissions` 讀回饋，改完用 `artifact_update` 發新版本。頁面會出現「有新版本」的提示；舊版本變成唯讀、不能再提交，還沒提交的回覆會帶到新版本。
+
+頁面上的「紀錄」列出每次提交的通知狀態（已通知 / 等 session 閒置 / session 已結束 / 等太久，沒有通知…）與 Claude 是否已讀。原本的 session 結束後，按頁面上的「接手…」可以把 artifact 交給另一個執行中、掛了 artifact 工具的 Claude session，之後由它改版、收通知。
+
+### 安全
+
+- artifact 的 HTML 只在 sandbox iframe 裡執行：`sandbox="allow-scripts allow-forms allow-popups allow-modals"`，**沒有** `allow-same-origin`。frame 路由（`/api/artifacts/:id/v/:n/frame/:frameId`）另外送 `Content-Security-Policy: sandbox …`，直接開 frame 網址也一樣被隔離。頁面拿不到 CODD 的 cookie，也不能呼叫 CODD 的 API。
+- 同一份 CSP 設 `connect-src 'none'`、`form-action 'none'`、`frame-src 'none'`：頁面不能連網抓資料，也不能把表單送到外部。
+- 前端只拿 iframe 的 `src`，不拿原始 HTML，也不用 `v-html` 顯示 artifact 的任何字串。
+- `/api/mcp` 不經過 Google 登入，改用 bearer token，而且只接受本機直連：帶 `cf-connecting-ip`、`x-forwarded-for` 這類轉送 header 的請求（經 Cloudflare Tunnel 進來的一定有）一律 403，所以 MCP 永遠不會經由 tunnel 對外。token 不會出現在 log、API 回應或錯誤訊息。
+- 打進終端機的只有上面那行固定格式的通知（標題去掉控制字元、截到 60 字）。你提交的內容不會打進終端機，Claude 只能用工具讀。
+- 任何 session 都能讀所有 artifact；只有建立它的 session（含 restart 後、或用「接手…」接手的）能改版、把提交標成已讀。
+
+### 設定（`.env`，皆選填）
+
+| 變數 | 預設 | 說明 |
+|---|---|---|
+| `CODD_PUBLIC_URL` | 未設 | artifact 連結的對外網址（不含結尾 `/`），例如 `https://codd.example.com` |
+| `TUNNEL_HOSTNAME` | 未設 | 沒設 `CODD_PUBLIC_URL` 時連結用 `https://<TUNNEL_HOSTNAME>`；兩個都沒設就是 `http://localhost:<PORT>`，從外面打不開。`.env.example` 的範例值 `codd.example.com` 也會照用，只在本機使用時要把那行刪掉 |
+| `CODD_ARTIFACTS_MCP` | 開 | `0`：不幫 session 掛 artifact MCP |
+| `CODD_ARTIFACTS_AUTO_ALLOW` | 開 | `0`：不帶 `--settings`，artifact 工具照 Claude Code 的權限設定詢問 |
+| `CODD_ARTIFACT_NOTIFY_UNKNOWN` | 關 | `1`：session 狀態不明時也送通知。風險是 Claude 可能正停在權限確認或選單，打進去的字和 Enter 會被當成選擇 |
+| `CODD_ARTIFACT_MAX_BYTES` | `3145728`（3 MiB） | 單一 artifact 的內容上限（可設 64 KiB 到 64 MiB）。單一 frame 另有 1.5 MiB 上限；`/api/mcp` 的請求大小上限會跟著放大（至少 8 MiB） |
+| `CODD_DATA_DIR` | `apps/server/data` | session log、MCP 設定檔（`mcp/`）、host token（`mcp-host-token`）放的位置，主要給測試用。資料庫位置仍看 `KANBAN_DB_PATH` |
+
+改了要重啟 server（會結束所有 session）。啟動 log 的 `[codd-server] artifacts: <網址>/artifacts（MCP on）` 那行會印出連結用的網址，以及 MCP 有沒有開。
+
+### 在不是 CODD 開的 session 使用
+
+server 啟動時會建立 host token：`apps/server/data/mcp-host-token`（0600）。在**主機上**自己開的 Claude Code（MCP 只接受本機直連，別台電腦不行）可以用它手動掛上：
+
+```bash
+# 在要用 artifact 的專案資料夾執行；預設 local scope，只對這個資料夾生效
+CODD=~/Github/fancy-codd    # CODD repo 的位置；PORT 不是 3000 時，網址也要改
+claude mcp add --transport http codd-artifacts-host http://127.0.0.1:3000/api/mcp \
+  --header "Authorization: Bearer $(cat "$CODD/apps/server/data/mcp-host-token")"
+```
+
+- **token 會以明文存進 Claude Code 的設定**（local / user scope 寫在 `~/.claude.json`），能讀那個檔案的程式都拿得到，可以用它在這台主機上建立 artifact、讀所有 artifact 與提交內容。不要用 `-s project`：那會寫進專案的 `.mcp.json`，可能被 commit。`$(cat …)` 的寫法至少不會讓 token 留在 shell history。
+- 名稱用 `codd-artifacts-host`，跟 CODD 自動掛的 `codd-artifacts` 分開；也不要用 `-s user`，否則 CODD 開的 session 會同時看到兩組工具，用到這組建立的 artifact 就沒有來源 session，收不到提交通知。
+- host token 建立的 artifact 沒有來源 session：提交後不會通知，要自己請 Claude 用 `artifact_read_submissions` 讀；也不能用 `html_path`。host token 只能改它自己建立的 artifact。之後想交給 CODD 開的 session，在頁面按「接手…」。
+- 這種 session 沒有 `--settings` 自動允許，呼叫工具時會出現 Claude Code 的權限詢問。
+- 撤銷：刪掉 `apps/server/data/mcp-host-token` 立刻失效，下次 server 啟動會產生新的；再 `claude mcp remove codd-artifacts-host`，需要時重新 add。
+
 ## 接上 Claude Code 狀態（hooks + statusline）
 
 側欄的 session 狀態（忙碌 / 等你輸入 / 閒置）、Claude 標題、最近一次 prompt，以及沒有 cswap 時底部的週用量，都來自 Claude Code 自己回報的資料。要拿到這些資料，得在 **跑 server 的那台機器（Mac mini）** 的 user-level `~/.claude/settings.json` 裝上 CODD 的 hooks 與 statusline。第一次打開網頁時首頁會引導你到 `/setup`（勾選 → 預覽 → 一鍵安裝），也可以用 CLI：
@@ -306,7 +405,7 @@ flag 一定要寫在 `--` 後面：`npm run channel install --dry-run` 的 `--dr
 
 ## 驗證
 
-安裝完成後的驗收清單見 [docs/agent-install.md](docs/agent-install.md) 步驟 12。
+安裝完成後的驗收清單見 [docs/agent-install.md](docs/agent-install.md) 步驟 12（Artifact 的確認在同一步的「選用：Artifact」）。
 
 ## 安全模型
 
@@ -316,6 +415,7 @@ flag 一定要寫在 `--` 後面：`npm run channel install --dry-run` 的 `--dr
 - 自家 session JWT 透過 **HTTP-only + Secure + SameSite=Strict cookie** 派發
 - CSP header 限制 script-src 只能來自 self、`accounts.google.com` 與 Cloudflare 強制注入的 `static.cloudflareinsights.com`
 - 寫入 API 一律 POST/PATCH/DELETE
+- Artifact 的 HTML 只在沒有 `allow-same-origin` 的 sandbox iframe 裡執行；`/api/mcp` 只收 bearer token 與本機直連，經 tunnel 進來一律 403。見 [Artifact 的安全](#安全)
 - 詳見 [configs/google-oauth-setup.md](configs/google-oauth-setup.md)
 
 ## License

@@ -124,6 +124,43 @@ export const api = {
   getIdentity: (name) => request(`/identity/${encodeURIComponent(name)}`),
   saveIdentity: (name, body) => request(`/identity/${encodeURIComponent(name)}`, { method: 'PUT', body: JSON.stringify(body) }),
 
+  // artifacts（CODD 自己托管的 HTML / 畫布；SPA 只拿 metadata 與 iframe src，不拿原始 HTML）
+  listArtifacts: ({ session, limit } = {}) => {
+    const q = new URLSearchParams();
+    if (session) q.set('session', session);
+    if (limit) q.set('limit', String(limit));
+    const qs = q.toString();
+    return request(`/artifacts${qs ? `?${qs}` : ''}`);
+  },
+  getArtifact: (id, { version } = {}) =>
+    request(`/artifacts/${encodeURIComponent(id)}${version ? `?v=${encodeURIComponent(version)}` : ''}`),
+  // 草稿 PUT 的 body（ArtifactView 要先量大小決定能不能用 keepalive，所以獨立出來）。
+  // base：上次 GET / PUT 拿到的 draft_updated_at（沒有草稿時是 null）；server 存的不一樣 → 409 draft_conflict。undefined = 不檢查
+  artifactDraftBody: (version, payload, base) =>
+    JSON.stringify(base === undefined ? { version, payload } : { version, payload, base_updated_at: base }),
+  // keepalive：關分頁 / 切到背景時用，讓請求在頁面卸載後仍送得出去（瀏覽器限制 body ≤ 64 KiB，呼叫端自己量）
+  saveArtifactDraft: (id, version, payload, { keepalive = false, base, body } = {}) =>
+    request(`/artifacts/${encodeURIComponent(id)}/draft`, {
+      method: 'PUT',
+      body: body ?? api.artifactDraftBody(version, payload, base),
+      ...(keepalive ? { keepalive: true } : {}),
+    }),
+  submitArtifact: (id, { version, payload, notify = true, base }) => request(`/artifacts/${encodeURIComponent(id)}/submissions`, {
+    method: 'POST',
+    body: JSON.stringify(base === undefined ? { version, payload, notify } : { version, payload, notify, base_updated_at: base }),
+  }),
+  // 把 artifact 交給另一個還在跑、掛了 artifact 工具的 Claude session（之後由它改版、收提交通知）
+  setArtifactOrigin: (id, terminalId) => request(`/artifacts/${encodeURIComponent(id)}/origin`, {
+    method: 'PUT',
+    body: JSON.stringify({ terminal_id: terminalId }),
+  }),
+  listArtifactSubmissions: (id) => request(`/artifacts/${encodeURIComponent(id)}/submissions`),
+  renameArtifact: (id, title) => request(`/artifacts/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ title }),
+  }),
+  deleteArtifact: (id) => request(`/artifacts/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+
   // kanban
   listColumns: () => request('/kanban/columns'),
   listCards: () => request('/kanban/cards'),
