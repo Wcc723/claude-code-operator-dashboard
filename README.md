@@ -92,8 +92,16 @@ flowchart TB
 │   ├── web/      # Vite + Vue 3 SPA
 │   └── mcp/      # @modelcontextprotocol/sdk stdio server
 ├── configs/
+│   ├── hooks/ · statusline/ · agents/   # 注入 Claude Code 的 hook、statusline、sub-agent
+│   ├── INSTALL.md
 │   ├── cloudflared.yml.example
+│   ├── cloudflared-service-setup.md
+│   ├── cloudflare-access-setup.md
 │   └── google-oauth-setup.md
+├── scripts/      # setup-cli.js（hooks + statusline）、channel-cli.js（channel 擴充）
+├── docs/
+│   └── agent-install.md   # 給 Agent 照做的安裝手冊
+├── AGENTS.md · CLAUDE.md
 ├── .env.example
 └── README.md
 ```
@@ -128,15 +136,35 @@ sequenceDiagram
   S->>TM: remove() ⇒ kill + removed=true
 ```
 
+## 讓 Agent 帶你安裝
+
+先在要常駐跑 CODD 的那台 Mac 上，用「終端機」App 做好這幾步（agent 要在 repo 裡才讀得到安裝手冊）：
+
+1. 安裝 Xcode Command Line Tools（含 git）：`xcode-select --install`，在對話框按「安裝」。
+2. 安裝 Claude Code：`curl -fsSL https://claude.ai/install.sh | bash`，開一個新的終端機視窗執行一次 `claude` 登入。
+3. clone repo（私有 repo 先設好 GitHub 存取權）。不要放在 `~/Documents`、`~/Desktop`、`~/Downloads` 或 iCloud 底下（macOS 隱私權保護，launchd 跑的 server 讀不到）：
+
+   ```bash
+   mkdir -p ~/Github && git clone https://github.com/Wcc723/claude-code-operator-dashboard.git ~/Github/fancy-codd && cd ~/Github/fancy-codd
+   ```
+
+4. 在這個資料夾執行 `claude`（或 `codex`），貼上這句：
+
+```text
+請讀 docs/agent-install.md，帶我安裝 CODD
+```
+
+Agent 會先偵測目前裝到哪一步，只在需要你本人時停下來（填 email 與網域、Google OAuth、Cloudflare、各種登入），其餘自己做並逐步驗證。完整流程見 [docs/agent-install.md](docs/agent-install.md)。
+
 ## 安裝
 
 需要 Node.js 20+ 與 macOS / Linux。
 
 ```bash
 # clone 完進到 root
-cp .env.example .env
-cp apps/web/.env.example apps/web/.env
+cp .env.example .env && chmod 600 .env
 # 編輯 .env、填入 CHANNEL_PATH / GOOGLE_CLIENT_ID / ALLOWED_EMAIL / SESSION_SECRET
+# 所有設定（含前端）都只讀這份根目錄 .env，不需要 apps/web/.env
 
 # 安裝
 npm install
@@ -169,11 +197,11 @@ Vite proxy 會把 `/api/*` 轉到 Express。
 
 ```bash
 npm run build     # 把 apps/web 編譯到 apps/web/dist
-npm start         # NODE_ENV=production，Express 同時服務 API 跟靜態檔
+npm start         # .env 的 NODE_ENV=production 時，Express 同時服務 API 跟靜態檔
 npm run tunnel    # cloudflared 起 named tunnel（需先按 configs/cloudflared.yml.example 設定）
 ```
 
-建議用 launchd / systemd / pm2 讓兩個 process 都自動啟動。
+建議用 launchd / systemd / pm2 讓兩個 process 都自動啟動；macOS 的 launchd 範例見 [docs/agent-install.md](docs/agent-install.md) 步驟 6。
 
 ## 帳號用量與切換（Claude / Codex）
 
@@ -250,11 +278,11 @@ Claude Code session 啟動後，agent 會自動看到 `mcp__codd-manager__list_s
 
 ## 擴充 Channel（hooks / sub-agents）
 
-Fancy CODD 提供兩個可注入 channel 的擴充：
+Fancy CODD 提供三個可注入 channel 的擴充：
 
 | 模組 | 內容 |
 |---|---|
-| **PostToolUse hook** | 把 session 狀態（last tool / tool count / idle）寫進 `STATUS_FILE_PATH`，平台 sidebar 顯示 |
+| **PostToolUse hook**（舊版） | 已由上面的 `npm run setup` 取代，`install` / `update` 預設跳過；`npm run setup -- install` 會移除舊的那條 |
 | **frontmatter-doctor sub-agent** | 對 channel 內 agents / skills 的 frontmatter 體檢，產 audit 報告 |
 | **codd-manager MCP** | 把 MCP server 掛進 channel `.mcp.json`，agent 可呼叫 kanban / schema tools |
 
@@ -266,17 +294,19 @@ npm run channel install     # 安裝（已存在則 skip）
 npm run channel update      # 升級
 npm run channel uninstall   # 卸載（軟卸載；--purge 連檔案刪）
 
-# 共通 flags
+# 共通 flags（要放在 -- 後面，例如 npm run channel -- install --dry-run）
 --dry-run            # 只印 diff 不寫
---only hooks,mcp     # 只動指定部分
+--only agents,mcp    # 只動指定部分
 --channel <path>     # 覆蓋 .env 的 CHANNEL_PATH
 ```
+
+flag 一定要寫在 `--` 後面：`npm run channel install --dry-run` 的 `--dry-run` 會被 npm 吃掉，結果是**真的安裝**。
 
 完整指引：[configs/INSTALL.md](configs/INSTALL.md)
 
 ## 驗證
 
-對應 plan 的 verification 清單見 `~/.claude/plans/claude-code-fancy-codd.md`。
+安裝完成後的驗收清單見 [docs/agent-install.md](docs/agent-install.md) 步驟 12。
 
 ## 安全模型
 
@@ -284,7 +314,7 @@ npm run channel uninstall   # 卸載（軟卸載；--purge 連檔案刪）
 - 後端 `verifyIdToken({ audience: GOOGLE_CLIENT_ID })` 驗簽 + 防 replay
 - `email === ALLOWED_EMAIL` 且 `email_verified === true` 才放行
 - 自家 session JWT 透過 **HTTP-only + Secure + SameSite=Strict cookie** 派發
-- CSP header 限制 script-src 只能來自 self 與 `accounts.google.com`
+- CSP header 限制 script-src 只能來自 self、`accounts.google.com` 與 Cloudflare 強制注入的 `static.cloudflareinsights.com`
 - 寫入 API 一律 POST/PATCH/DELETE
 - 詳見 [configs/google-oauth-setup.md](configs/google-oauth-setup.md)
 

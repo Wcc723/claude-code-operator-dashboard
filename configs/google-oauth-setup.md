@@ -21,7 +21,7 @@
    - **Authorized redirect URIs**：**留空**（ID Token 模式不需要 redirect）
 5. 建立後拿到 **Client ID**（長得像 `xxxxx-yyyy.apps.googleusercontent.com`）
    - 把它寫進根目錄 `.env` 的 `GOOGLE_CLIENT_ID`
-   - Vite 已設定自動從 root `.env` 讀此值並注入為 `import.meta.env.VITE_GOOGLE_CLIENT_ID`，**通常不需另外設 `apps/web/.env`**（只有 dev/prod 想用不同 Client ID 時才需覆寫）
+   - Vite 已設定自動從 root `.env` 讀此值並注入為 `import.meta.env.VITE_GOOGLE_CLIENT_ID`。**不要建立 `apps/web/.env`**（Vite 不會讀它），也不要在 root `.env` 另設不同值的 `VITE_GOOGLE_CLIENT_ID`：server 只認 `GOOGLE_CLIENT_ID` 為 audience，前端用別的 Client ID 時登入一律 401 `Wrong recipient`
    - **Client secret 不用複製，本平台不會用到**
 
 ## 2. 設定 ALLOWED_EMAIL

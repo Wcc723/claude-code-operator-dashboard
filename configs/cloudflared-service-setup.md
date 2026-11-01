@@ -53,17 +53,20 @@ dashboard → **Networks → Tunnels** → 點你的 tunnel → **Configure** �
 
 ### 2. 裝 service
 
+在 dashboard 複製 token 後，於主機終端機執行（用 `pbpaste` 帶入剪貼簿，token 不會留在 shell history；不要把 token 直接打在指令列）：
+
 ```bash
 # 需要 sudo（launchd 寫到 /Library/LaunchDaemons）
-sudo cloudflared service install <token>
+sudo cloudflared service install "$(pbpaste)"
 ```
 
 這會做幾件事：
-- 建立 `/Library/LaunchDaemons/com.cloudflare.cloudflared.plist`
-- 把 token 存到 `/etc/cloudflared/config.yml`
+- 建立 `/Library/LaunchDaemons/com.cloudflare.cloudflared.plist`，token 直接寫在它的 ProgramArguments（`tunnel run --token <token>`），不是 `/etc/cloudflared/config.yml`
 - 啟動 launchd service 並設定開機自啟
 
 裝完馬上會跑起來，幾秒內看到對應 connector 在 dashboard 顯示綠燈。
+
+⚠️ 因為 token 在 plist 裡，也會出現在 `launchctl print system/com.cloudflare.cloudflared` 與 `ps` 的指令列：不要 `cat`、`plutil -p`、`grep` 這個 plist，不要 `ps aux | grep cloudflared`（改用 `pgrep -x cloudflared`），也不要把這些輸出貼到對話或 issue。
 
 ### 3. 驗證
 
@@ -71,11 +74,11 @@ sudo cloudflared service install <token>
 # 看 service 狀態
 sudo launchctl list | grep cloudflared
 
-# 看 log（service 模式 log 寫這）
-tail -f /var/log/cloudflared.log
+# 看 log（service 模式寫在 /Library/Logs；錯誤訊息在 .err.log，另有 .out.log）
+tail -f /Library/Logs/com.cloudflare.cloudflared.err.log
 
 # 確認 tunnel 真的通
-curl -I https://codd.casper.tw/api/health
+curl -I https://codd.example.com/api/health
 ```
 
 ## 日常操作
@@ -92,10 +95,10 @@ sudo launchctl unload /Library/LaunchDaemons/com.cloudflare.cloudflared.plist
 sudo launchctl load   /Library/LaunchDaemons/com.cloudflare.cloudflared.plist
 
 # 看 log（持續）
-tail -f /var/log/cloudflared.log
+tail -f /Library/Logs/com.cloudflare.cloudflared.err.log
 
 # 看最近 100 行 log
-tail -n 100 /var/log/cloudflared.log
+tail -n 100 /Library/Logs/com.cloudflare.cloudflared.err.log
 ```
 
 ## 改 ingress 設定後
@@ -113,7 +116,7 @@ tail -n 100 /var/log/cloudflared.log
 sudo cloudflared service uninstall
 ```
 
-會清掉 launchd plist + `/etc/cloudflared/config.yml`。Tunnel 本身不會刪（仍在 Cloudflare 那邊），可以 `cloudflared tunnel delete <name>` 從 Cloudflare 移除。
+會停掉服務並移除 launchd plist（token 也跟著移除）。Tunnel 本身不會刪（仍在 Cloudflare 那邊），可以 `cloudflared tunnel delete <name>` 從 Cloudflare 移除。
 
 ## 排錯
 
@@ -123,14 +126,15 @@ sudo cloudflared service uninstall
 
 ```bash
 sudo cloudflared service uninstall
-sudo cloudflared service install <new-token>
+# 先在 dashboard 複製新的 token
+sudo cloudflared service install "$(pbpaste)"
 ```
 
 ### service 狀態看起來在跑但 tunnel 沒上線
 
 ```bash
 # 看 log 最後幾行找錯誤
-tail -n 50 /var/log/cloudflared.log
+tail -n 50 /Library/Logs/com.cloudflare.cloudflared.err.log
 
 # 常見錯誤：
 # - "Unable to reach Cloudflare edge" → 網路 / 防火牆問題
@@ -138,10 +142,12 @@ tail -n 50 /var/log/cloudflared.log
 # - "Failed to authenticate" → token 過期或失效，去 dashboard 重新拿
 ```
 
-### 想看 service 跑的真實命令
+### 想看 service 跑的是哪個 cloudflared
+
+只取 ProgramArguments 的第一個元素（執行檔路徑）。其餘參數含 tunnel token，不要整段印出來：
 
 ```bash
-sudo cat /Library/LaunchDaemons/com.cloudflare.cloudflared.plist | grep -A 10 ProgramArguments
+plutil -extract ProgramArguments.0 raw /Library/LaunchDaemons/com.cloudflare.cloudflared.plist
 ```
 
 ### 升級 cloudflared

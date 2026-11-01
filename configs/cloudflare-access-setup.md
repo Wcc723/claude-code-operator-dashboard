@@ -15,7 +15,7 @@
 
 - Cloudflare 帳號需要有 Zero Trust 服務（免費版 50 user，個人用綽綽有餘）
   - 第一次用會要你建立 team name（例如 `mycompany`）→ 你的 Access 入口會是 `<your-team>.cloudflareaccess.com`
-- 你的 cloudflared tunnel 已經跑起來、`codd.example.com` 已透過 DNS route 指向 tunnel
+- 網域已經在這個 Cloudflare 帳號、狀態是 Active。**建議先設好 Access，再把 hostname 接上 tunnel**（新增 Public Hostname 或 `cloudflared tunnel route dns`）：hostname 還沒有 DNS 記錄也能先建 Access application，這樣網站上線的第一秒就有 Access 保護
 
 ## 設定步驟
 
@@ -133,16 +133,25 @@ Service token 在 Access policy 內以 **Include → Service Auth → Service To
 
 ### Tunnel 加 ingress 分離
 
-進階：在 `cloudflared.yml` 內把 webhook / health 與 admin UI 分到不同 hostname：
+進階：把 webhook / health 與 admin UI 分到不同 hostname。優先考慮改用上面的 Service Token；真的要拆時，公開的 hostname 一定要限制 path，而且用 `127.0.0.1`（server 只綁 IPv4，`localhost` 可能解析成 IPv6 而連不到）。本機設定檔模式（`cloudflared.yml`）寫法：
 
 ```yaml
 ingress:
-  - hostname: codd-health.your-domain.com    # 公開，無 Access
-    service: http://localhost:3005
-    path: /api/health
+  - hostname: codd-health.your-domain.com    # 公開，無 Access；只放行完全等於 /api/health 的路徑
+    service: http://127.0.0.1:3000
+    path: ^/api/health$
   - hostname: codd.your-domain.com           # 私有，有 Access policy
-    service: http://localhost:3005
+    service: http://127.0.0.1:3000
   - service: http_status:404
+```
+
+Dashboard 管理模式（`cloudflared service install` 的 token 模式）則是在 tunnel 的 **Public Hostname** 再新增一筆 `codd-health.your-domain.com`：Service 選 `HTTP`、URL 填 `127.0.0.1:<PORT>`，**Path 必須填 `^/api/health$`**（留空會讓整個 CODD 在這個 hostname 上沒有 Access），而且不要把它加進 Access application。
+
+建立後驗證其他路徑都進不去（兩個都應該回 `404`）：
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" https://codd-health.your-domain.com/
+curl -s -o /dev/null -w "%{http_code}\n" https://codd-health.your-domain.com/api/auth/me
 ```
 
 這樣監控系統可以 ping `codd-health.*` 不被 Access 擋，admin UI 仍有完整保護。
