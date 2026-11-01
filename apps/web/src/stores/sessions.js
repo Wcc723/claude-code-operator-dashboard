@@ -95,6 +95,24 @@ function keepLocalOrder(next, prev) {
   return next.map((x) => (local.has(x.id) ? { ...x, order: local.get(x.id) } : x));
 }
 
+// ───── 標記色的樂觀更新 ─────
+// 本地先改、PATCH 背景送。這段期間的 poll 可能帶回舊顏色（poll 比 PATCH 早發、或 server 還沒處理到），
+// 要沿用本地的值，否則色條會閃回舊色再跳回來。判斷方式同拖曳排序的 reorderEpoch：
+// - colorPending：id → 還沒回應的 PATCH 數
+// - colorTouched：id → 最後一次 setColor 的序號；poll 開始時記下 colorSeq，序號比它新的 = 這份資料發出時還沒包含這次改色
+let colorSeq = 0;
+const colorPending = new Map();
+const colorTouched = new Map();
+// 同一個 session 的 PATCH 依序送（前一個回來才送下一個），server 最後的值才會是最後點的那個顏色
+const colorChains = new Map();
+
+function keepLocalColor(next, prev, since) {
+  const keep = (id) => colorPending.has(id) || (colorTouched.get(id) ?? 0) > since;
+  const local = new Map(prev.filter((x) => keep(x.id)).map((x) => [x.id, x.color ?? null]));
+  if (!local.size) return next;
+  return next.map((x) => (local.has(x.id) ? { ...x, color: local.get(x.id) } : x));
+}
+
 // timers / listener 放 module 層：不需要 reactive，也避免 HMR 時 state 裡塞 handle
 let sessionsTimer = null;
 let systemTimer = null;
@@ -159,6 +177,9 @@ export const useSessionsStore = defineStore('sessions', {
       }
       this.items = [];
       this.profiles = [];
+      colorPending.clear();
+      colorTouched.clear();
+      colorChains.clear();
       this.system = null;
       this.loaded = false;
       this.error = null;
@@ -193,10 +214,17 @@ export const useSessionsStore = defineStore('sessions', {
       run = (async () => {
         if (prev) await prev.catch(() => {});
         const epoch = reorderEpoch;
+        const colorSince = colorSeq;
         try {
           const { items } = await api.listSessions();
-          const next = Array.isArray(items) ? items : [];
-          this.items = reorderPending || epoch !== reorderEpoch ? keepLocalOrder(next, this.items) : next;
+          let next = Array.isArray(items) ? items : [];
+          if (reorderPending || epoch !== reorderEpoch) next = keepLocalOrder(next, this.items);
+          if (colorPending.size || colorSince !== colorSeq) next = keepLocalColor(next, this.items, colorSince);
+          this.items = next;
+          // 列表請求是一個接一個發的（見上面的 prev）：這份資料已經包含 colorSince 以前的改色，舊紀錄可以丟了
+          for (const [id, seq] of colorTouched) {
+            if (seq <= colorSince && !colorPending.has(id)) colorTouched.delete(id);
+          }
           this.error = null;
         } catch (e) {
           this.error = e.message;
@@ -236,8 +264,12 @@ export const useSessionsStore = defineStore('sessions', {
     _upsert(rec) {
       if (!rec?.id) return;
       const i = this.items.findIndex((x) => x.id === rec.id);
-      if (i >= 0) this.items.splice(i, 1, { ...this.items[i], ...rec });
-      else this.items.unshift(rec);
+      if (i >= 0) {
+        const merged = { ...this.items[i], ...rec };
+        // 改色的 PATCH 還沒回來：server 這份回應不一定已經包含新顏色，沿用本地的
+        if (colorPending.has(rec.id)) merged.color = this.items[i].color ?? null;
+        this.items.splice(i, 1, merged);
+      } else this.items.unshift(rec);
     },
 
     async spawn(profileId, size) {
@@ -250,6 +282,7 @@ export const useSessionsStore = defineStore('sessions', {
     // ids = 執行中 session 的新順序（側欄拖曳 / 鍵盤移動）。先在本地排好，再送 server 讓其他裝置同步
     async reorder(ids) {
       const epoch = ++reorderEpoch;
+      const colorSince = colorSeq;
       const pos = new Map(ids.map((id, i) => [id, i]));
       this.items
         .filter((x) => !pos.has(x.id))
@@ -268,8 +301,51 @@ export const useSessionsStore = defineStore('sessions', {
       }
       // 期間又拖了一次：以最新那次為準，這次的回應丟掉
       if (epoch !== reorderEpoch) return;
-      if (Array.isArray(fresh)) this.items = fresh;
-      else await this.refresh({ force: true }); // 失敗（例如舊版 server 沒有這支 API）就回到 server 的順序
+      if (Array.isArray(fresh)) {
+        // 排序的回應同樣可能比改色的 PATCH 早產生：沿用本地顏色
+        this.items = colorPending.size || colorSince !== colorSeq ? keepLocalColor(fresh, this.items, colorSince) : fresh;
+      } else {
+        await this.refresh({ force: true }); // 失敗（例如舊版 server 沒有這支 API）就回到 server 的順序
+      }
+    },
+
+    _patchLocal(id, patch) {
+      const i = this.items.findIndex((x) => x.id === id);
+      if (i >= 0) this.items.splice(i, 1, { ...this.items[i], ...patch });
+    },
+
+    // 標記色：color = palette key（colors.js）或 null（不標色）。樂觀更新，失敗還原並 throw（呼叫端顯示錯誤）
+    async setColor(id, color) {
+      const next = color || null;
+      const cur = this.byId(id);
+      const before = cur ? (cur.color ?? null) : null;
+      const seq = ++colorSeq;
+      colorTouched.set(id, seq);
+      colorPending.set(id, (colorPending.get(id) ?? 0) + 1);
+      this._patchLocal(id, { color: next });
+
+      const run = (colorChains.get(id) ?? Promise.resolve())
+        .catch(() => {})
+        .then(() => api.setSessionColor(id, next));
+      colorChains.set(id, run);
+      try {
+        const s = await run;
+        // 期間又改了一次：以最新那次為準。只更新顏色，其他欄位交給 poll（避免蓋掉拖曳中的本地順序）
+        if (colorTouched.get(id) === seq && s?.id === id) this._patchLocal(id, { color: s.color ?? null });
+        return s;
+      } catch (e) {
+        if (colorTouched.get(id) === seq) {
+          this._patchLocal(id, { color: before });
+          // 連續改了好幾次又失敗時 before 不一定是 server 上的值：等這輪 PATCH 都結束後重抓一次對齊
+          queueMicrotask(() => { if (!colorPending.has(id)) this.refresh({ force: true }); });
+        }
+        throw e;
+      } finally {
+        const n = (colorPending.get(id) ?? 1) - 1;
+        if (n > 0) colorPending.set(id, n);
+        else colorPending.delete(id);
+        if (colorChains.get(id) === run) colorChains.delete(id);
+      }
     },
 
     async kill(id) {

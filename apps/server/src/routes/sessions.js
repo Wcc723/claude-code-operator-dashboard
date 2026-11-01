@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { execFile } from 'node:child_process';
 import { basename } from 'node:path';
 import { homedir } from 'node:os';
+import { parseColor } from '../services/colors.js';
 
 // AppleScript 字串內的 " 要轉成 \" ，\ 要轉成 \\
 function escapeAS(s) {
@@ -77,6 +78,21 @@ export function sessionsRouter(terminal, insights) {
 
   router.get('/:id', async (req, res) => {
     const s = terminal.get(req.params.id);
+    if (!s) return res.status(404).json({ error: 'not found' });
+    res.json(await enrichRecord(insights, s));
+  });
+
+  // 改 session 的屬性。目前只有標記色：body { color: <palette key> | null }（null / '' / 'none' = 清除）。
+  // 沒帶 color 視為打錯（例如 Content-Type 不對讓 body 變空），回 400，不要當成「清除顏色」
+  router.patch('/:id', async (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (!Object.hasOwn(body, 'color')) {
+      return res.status(400).json({ error: 'nothing to update: color required (palette key or null)' });
+    }
+    let color;
+    try { color = parseColor(body.color); }
+    catch (e) { return res.status(e.status ?? 400).json({ error: e.message }); }
+    const s = terminal.setColor(req.params.id, color);
     if (!s) return res.status(404).json({ error: 'not found' });
     res.json(await enrichRecord(insights, s));
   });

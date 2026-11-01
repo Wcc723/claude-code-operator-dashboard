@@ -2,6 +2,7 @@
 import { onMounted, onUnmounted, ref } from 'vue';
 import { RouterLink, useRouter } from 'vue-router';
 import { useSessionsStore } from '../stores/sessions.js';
+import { colorHex } from '../colors.js';
 
 const store = useSessionsStore();
 const router = useRouter();
@@ -14,7 +15,7 @@ const root = ref(null);
 function toggle() {
   open.value = !open.value;
   error.value = null;
-  // 每次打開都重抓：profile 可能剛在 PROFILES 頁改過
+  // 每次打開都重抓：project 可能剛在 PROJECTS 頁改過
   if (open.value) store.loadProfiles();
 }
 
@@ -68,10 +69,10 @@ onUnmounted(() => {
     >+ NEW <span class="caret">▾</span></button>
 
     <div v-if="open" class="menu" role="menu">
-      <div class="menu-head">LAUNCH PROFILE</div>
+      <div class="menu-head">PROJECT</div>
       <p v-if="!store.profiles.length" class="menu-empty">
-        // 還沒有 profile<br />
-        <RouterLink to="/profiles" @click="close">建立一個 →</RouterLink>
+        // 還沒有 project<br />
+        <RouterLink to="/projects" @click="close">建立一個 →</RouterLink>
       </p>
       <button
         v-for="p in store.profiles"
@@ -83,13 +84,20 @@ onUnmounted(() => {
         @click="pick(p)"
       >
         <span class="name">
-          <span class="arrow">{{ spawningId === p.id ? '…' : '▸' }}</span>{{ p.name }}
+          <span class="arrow">{{ spawningId === p.id ? '…' : '▸' }}</span>
+          <!-- project 標記色：新 session 會繼承它，所以選單上先讓人看到 -->
+          <span
+            class="dot"
+            :class="{ empty: !colorHex(p.color) }"
+            :style="colorHex(p.color) ? { '--dot': colorHex(p.color) } : null"
+            aria-hidden="true"
+          />{{ p.name }}
         </span>
         <span class="cwd">{{ p.cwd }}</span>
       </button>
       <p v-if="error" class="menu-error">{{ error }}</p>
       <div class="menu-foot">
-        <RouterLink to="/profiles" @click="close">管理 profiles →</RouterLink>
+        <RouterLink to="/projects" @click="close">管理 projects →</RouterLink>
       </div>
     </div>
   </div>
@@ -183,8 +191,23 @@ onUnmounted(() => {
   width: 14px;
   color: var(--amber-dim);
 }
+.dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 7px;
+  border-radius: 50%;
+  background: var(--dot);
+  box-shadow: 0 0 5px var(--dot);
+  vertical-align: 1px;
+}
+/* 沒標色的 project 留同寬的空位，名稱才會對齊 */
+.dot.empty {
+  background: transparent;
+  box-shadow: none;
+}
 .cwd {
-  padding-left: 14px;
+  padding-left: 29px;
   font-size: 11.5px;
   color: var(--dimmer);
   overflow: hidden;

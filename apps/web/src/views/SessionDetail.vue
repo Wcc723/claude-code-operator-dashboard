@@ -1,5 +1,5 @@
 <script setup>
-import { ref, shallowRef, computed, watch, onMounted, onBeforeUnmount } from 'vue';
+import { ref, shallowRef, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue';
 import { useRouter, RouterLink } from 'vue-router';
 import { api } from '../api.js';
 import { useSessionsStore } from '../stores/sessions.js';
@@ -7,6 +7,8 @@ import * as pool from '../composables/terminalPool.js';
 import TerminalPane from '../components/TerminalPane.vue';
 import KeyBar from '../components/KeyBar.vue';
 import Composer from '../components/Composer.vue';
+import ColorPicker from '../components/ColorPicker.vue';
+import { colorHex, colorMeta } from '../colors.js';
 
 const props = defineProps({ id: { type: String, required: true } });
 const router = useRouter();
@@ -143,16 +145,69 @@ function toggleComposer() {
 const showKeyBar = computed(() => !exited.value && (composerOn.value || coarse));
 const showComposer = computed(() => !exited.value && composerOn.value);
 
+// ───── 標記色（頁首色塊 → ColorPicker） ─────
+// 放在 .ident 外面：.ident 的 hover 會開「最近 prompt」popover，兩個浮層會疊在一起。
+// 手機版 .line1 整行隱藏（標題在 App 的 top bar），色塊不跟著藏，所以獨立成一個 flex item
+const tagHex = computed(() => colorHex(session.value?.color));
+const tagLabel = computed(() => {
+  const m = colorMeta(session.value?.color);
+  return m ? `${m.label}色` : '未標色';
+});
+const colorOpen = ref(false);
+const colorWrapRef = ref(null);
+const colorBtnRef = ref(null);
+
+async function toggleColor() {
+  if (colorOpen.value) {
+    closeColor(true);
+    return;
+  }
+  menuOpen.value = false;
+  colorOpen.value = true;
+  await nextTick();
+  colorWrapRef.value?.querySelector('[role="radio"][tabindex="0"]')?.focus({ preventScroll: true });
+}
+
+function closeColor(restoreFocus = false) {
+  if (!colorOpen.value) return;
+  colorOpen.value = false;
+  if (restoreFocus) colorBtnRef.value?.focus({ preventScroll: true });
+}
+
+async function pickColor(color) {
+  const id = props.id;
+  actionError.value = '';
+  try {
+    await store.setColor(id, color);
+  } catch (e) {
+    // store 已經還原顏色；只提示沒存到
+    if (props.id === id) actionError.value = `標記色沒存到：${e?.message || 'failed'}`;
+  }
+}
+
+// 點色塊（或在色塊上按 Enter / Space）= 選好了；←/→ 只換色不關
+function onColorPopClick(e) {
+  if (e.target.closest?.('[role="radio"]')) closeColor(true);
+}
+
+// Tab 離開才關；relatedTarget = null（Safari 點按鈕不給焦點）不算，交給 pointerdown 判斷
+function onColorFocusOut(e) {
+  if (e.relatedTarget && !colorWrapRef.value?.contains(e.relatedTarget)) closeColor(false);
+}
+
 // ───── ⋯ menu ─────
 const menuOpen = ref(false);
 const menuRef = ref(null);
 function onDocPointerDown(e) {
   if (menuOpen.value && menuRef.value && !menuRef.value.contains(e.target)) menuOpen.value = false;
   if (promptOpen.value && coarse && !e.target.closest?.('.ident')) promptOpen.value = false;
+  if (colorOpen.value && colorWrapRef.value && !colorWrapRef.value.contains(e.target)) closeColor(false);
 }
 function onDocKeydown(e) {
   if (e.key === 'Escape' && menuOpen.value) menuOpen.value = false;
   if (e.key === 'Escape' && promptOpen.value) promptOpen.value = false;
+  // 焦點在色塊浮層裡才還給按鈕；在終端機裡按 Esc 不要把焦點搶走
+  if (e.key === 'Escape' && colorOpen.value) closeColor(!!colorWrapRef.value?.contains(document.activeElement));
 }
 
 // ───── 動作 ─────
@@ -270,6 +325,7 @@ watch(() => termState.value?.exited, (v) => { if (v) store.refresh({ force: true
 watch(() => props.id, () => {
   menuOpen.value = false;
   promptOpen.value = false;
+  colorOpen.value = false;
   actionError.value = '';
 });
 
@@ -297,6 +353,35 @@ onBeforeUnmount(() => {
 
     <template v-else>
       <header class="head">
+        <div ref="colorWrapRef" class="tag-wrap">
+          <button
+            ref="colorBtnRef"
+            type="button"
+            class="tag-btn"
+            :style="tagHex ? { '--tag': tagHex } : null"
+            :title="`標記色：${tagLabel}`"
+            :aria-label="`標記色（${tagLabel}）`"
+            aria-haspopup="dialog"
+            :aria-expanded="colorOpen"
+            :disabled="!session"
+            @click="toggleColor"
+          ><span class="tag-dot" :class="{ none: !tagHex }" aria-hidden="true" /></button>
+          <div
+            v-if="colorOpen && session"
+            class="tag-pop"
+            role="dialog"
+            aria-label="這個 session 的標記色"
+            @click="onColorPopClick"
+            @focusout="onColorFocusOut"
+          >
+            <div class="tag-pop-label">標記色</div>
+            <ColorPicker
+              :model-value="session.color ?? null"
+              label="這個 session 的標記色"
+              @change="pickColor"
+            />
+          </div>
+        </div>
         <div
           class="ident"
           @mouseenter="identEnter"
@@ -570,6 +655,67 @@ onBeforeUnmount(() => {
   .pop-body { max-height: 30vh; }
 }
 
+/* ───── 標記色 ───── */
+.tag-wrap {
+  position: relative;
+  flex: none;
+  /* 跟右邊的狀態燈靠近一點（.head 的 gap 是 12px） */
+  margin-right: -4px;
+}
+.tag-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 28px;
+  min-width: 0;
+  padding: 0;
+  border: 1px solid transparent;
+  letter-spacing: 0;
+}
+.tag-btn::before,
+.tag-btn::after { content: none; }
+.tag-btn:hover {
+  border-color: var(--line-bright);
+  box-shadow: none;
+}
+.tag-btn:focus-visible { outline: 1px solid var(--amber); outline-offset: 1px; }
+.tag-btn[aria-expanded='true'] { border-color: var(--amber-dim); }
+/* 圓角方塊，不用圓點：跟狀態燈（● ◆ ○）的形狀分開 */
+.tag-dot {
+  display: block;
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  background: var(--tag);
+}
+.tag-dot.none {
+  background: transparent;
+  border: 1px dashed var(--dimmer);
+}
+.tag-pop {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 30;
+  padding: 10px 12px;
+  background: var(--bg-lift);
+  border: 1px solid var(--line-bright);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.6);
+  width: max-content;
+  max-width: calc(100vw - 24px);
+}
+.tag-pop-label {
+  margin-bottom: 8px;
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  color: var(--dim);
+}
+@media (pointer: coarse) {
+  .tag-btn { width: 36px; height: 40px; }
+  .tag-dot { width: 14px; height: 14px; }
+}
+
 /* ───── actions ───── */
 .actions {
   flex: none;
@@ -670,6 +816,7 @@ onBeforeUnmount(() => {
   /* 手機版的標題與狀態已經在 App 的 top bar：這裡只留路徑 / 時間 + 動作 */
   .line1 { display: none; }
   .head { padding: 4px 6px 4px 10px; gap: 6px; }
+  .tag-wrap { margin: 0 0 0 -6px; }
   .line2 { margin-top: 0; font-size: 12.5px; }
   .ident { cursor: pointer; }
   .only-desktop { display: none; }

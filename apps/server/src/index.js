@@ -17,6 +17,8 @@ import { TerminalManager } from './services/terminal-manager.js';
 import { SessionInsights } from './services/session-insights.js';
 import { resolveStatusDir } from './services/status-paths.js';
 import { SystemSampler } from './services/system-stats.js';
+import { ClaudeAccounts } from './services/claude-accounts.js';
+import { CodexAccounts } from './services/codex-accounts.js';
 
 import { authRouter } from './routes/auth.js';
 import { skillsRouter } from './routes/skills.js';
@@ -30,6 +32,7 @@ import { launchProfilesRouter } from './routes/launch-profiles.js';
 import { sessionsRouter } from './routes/sessions.js';
 import { systemRouter } from './routes/system.js';
 import { setupRouter } from './routes/setup.js';
+import { accountsRouter } from './routes/accounts.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT ?? 3000);
@@ -49,6 +52,9 @@ const terminal = new TerminalManager({
 const statusDir = resolveStatusDir();
 const insights = new SessionInsights({ statusDir });
 const sampler = new SystemSampler({ terminal });
+// 帳號切換：Claude 走 cswap、Codex 走 codex app-server + 本機帳號庫（CSWAP_BIN / CODEX_BIN / CODEX_HOME / CODD_CODEX_VAULT）
+const claudeAccounts = new ClaudeAccounts();
+const codexAccounts = new CodexAccounts();
 const authGate = new AuthGate({
   clientId: process.env.GOOGLE_CLIENT_ID,
   allowedEmail: process.env.ALLOWED_EMAIL,
@@ -102,6 +108,7 @@ app.use('/api/launch-profiles', protect, launchProfilesRouter(profileRepo));
 app.use('/api/terminal/sessions', protect, sessionsRouter(terminal, insights));
 app.use('/api/system', protect, systemRouter(sampler, insights));
 app.use('/api/setup', protect, setupRouter({ statusDir, repoRoot: resolve(__dirname, '../../..') }));
+app.use('/api/accounts', protect, accountsRouter({ claude: claudeAccounts, codex: codexAccounts }));
 
 if (isProd) {
   const distPath = resolve(__dirname, '../../web/dist');
@@ -153,6 +160,9 @@ async function shutdown(signal) {
   }, 12000).unref();
 
   sampler.stop();
+  // cswap / codex app-server 子行程：codex 探測用的暫存 CODEX_HOME 裡有 token，要等它清完（stop 自己最多等 4 s）
+  claudeAccounts.stop();
+  const accountsStopped = codexAccounts.stop().catch(() => {});
 
   // 1. HTTP server：停接新連線、強制斷現有 keep-alive；同時 await 真的關閉
   if (typeof server.closeAllConnections === 'function') {
@@ -171,6 +181,7 @@ async function shutdown(signal) {
 
   // 3. 等 HTTP 完全關掉再關 DB（PTY 在 onExit 會 logStream.end()，先讓它寫完）
   await httpClosed;
+  await accountsStopped;
   try { db.close(); } catch {}
 
   if (killErr) console.error('[codd-server] killAll error', killErr);

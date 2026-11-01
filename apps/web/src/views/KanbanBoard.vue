@@ -98,13 +98,13 @@ async function onDrop(columnId) {
 </script>
 
 <template>
+  <!-- 大標題由 STATION 的分頁列負責；這裡只留索引列與動作 -->
   <div class="toolbar">
-    <h2 style="margin: 0">KANBAN</h2>
+    <p class="section-meta" style="margin: 0">BOARD · {{ cards.length }} cards</p>
     <span class="spacer" />
     <RefreshButton :on-refresh="load" />
     <button class="primary" @click="openCreate()">+ NEW</button>
   </div>
-  <p class="section-meta">BOARD · {{ cards.length }} cards</p>
   <p v-if="loading" class="notice">// loading …</p>
   <div v-else class="kanban-board">
     <div v-for="col in columns" :key="col.id" class="kanban-column">

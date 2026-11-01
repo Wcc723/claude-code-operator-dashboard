@@ -207,11 +207,11 @@ const items = computed(() => {
   if (sl.mode === 'wrapped') slDetail.push('已串接你原本的 statusLine 指令，終端機上的顯示不變。');
   else if (sl.mode === 'standalone') slDetail.push('CODD 自己輸出一行精簡狀態。');
   else if (sl.has_foreign) slDetail.push('安裝時會保留並串接你原本的 statusLine 指令，顯示維持原樣。');
-  else slDetail.push('目前沒有 statusLine，安裝後會顯示一行：資料夾 · 模型 · context · 5h 剩餘。');
+  else slDetail.push('目前沒有 statusLine，安裝後會顯示一行：資料夾 · 模型 · context · 週用量剩餘。');
   list.push({
     part: 'statusline',
     name: 'Statusline',
-    purpose: '取得 Claude Code 的 session 標題、context 剩餘與目前帳號的 5h/1w 用量。',
+    purpose: '取得 Claude Code 的 session 標題、context 剩餘與目前帳號的週用量。',
     state: STATE[sl.state] || STATE.missing,
     detail: slDetail,
     fresh: [
@@ -284,7 +284,7 @@ const PART_LABEL = { hooks: 'HOOKS', statusline: 'STATUSLINE', legacy: 'LEGACY' 
   <!-- 精簡模式：一行提示，完成或關掉後就不再出現 -->
   <div v-if="showBanner" class="banner" role="status">
     <span class="b-glyph" aria-hidden="true">◆</span>
-    <span class="b-msg">完成設定以取得 session 狀態與 5h/1w 用量</span>
+    <span class="b-msg">完成設定以取得 session 狀態與週用量</span>
     <RouterLink to="/setup" class="b-go">→ 設定</RouterLink>
     <button type="button" class="b-dismiss" aria-label="不再顯示這個提示" title="不再顯示" @click="dismiss">✕</button>
   </div>
@@ -319,7 +319,7 @@ const PART_LABEL = { hooks: 'HOOKS', statusline: 'STATUSLINE', legacy: 'LEGACY' 
           <strong>為什麼：</strong>CODD 開的 session 都帶著 <code>CODD_TERMINAL_ID</code>。
           hooks 在 Claude Code 事件發生時寫一個小的狀態檔，statusLine 順便記下標題、context 與用量，
           側欄和底部的用量面板就是讀這些檔案<template v-if="status.status_dir">（放在 <code>{{ status.status_dir }}</code>）</template>。不是 CODD 開的 session，hook 指令檢查這個變數後就直接結束，幾乎沒有負擔；
-          statusLine 則會替每個 session 記下 5h/1w 用量百分比，不存 email 或 token。
+          statusLine 則會替每個 session 記下週用量百分比，不存 email 或 token。
         </p>
         <p>
           <strong>可以還原：</strong>寫入前會先備份成 <code>settings.json.codd-bak-&lt;時間&gt;</code>，

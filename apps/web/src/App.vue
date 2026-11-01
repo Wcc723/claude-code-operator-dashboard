@@ -7,17 +7,15 @@ import SessionSidebar from './components/SessionSidebar.vue';
 import NewSessionButton from './components/NewSessionButton.vue';
 import DeviceStatus from './components/DeviceStatus.vue';
 import SetupGuide from './components/SetupGuide.vue';
+import { colorHex, colorMeta } from './colors.js';
+import { stationTabOf, stationTabLabel } from './station.js';
 
-const WORKSPACE = [
-  { to: '/identity', label: 'IDENTITY' },
-  { to: '/skills', label: 'SKILLS' },
-  { to: '/agents', label: 'AGENTS' },
-  { to: '/tasks', label: 'TASKS' },
-  { to: '/memory', label: 'MEMORY' },
-  { to: '/kanban', label: 'KANBAN' },
-  { to: '/profiles', label: 'PROFILES' },
-  // /sessions/:id 屬於上面的 SESSIONS 區，不算在 WORKSPACE
-  { to: '/sessions', label: 'ALL SESSIONS', exact: true },
+// 側欄只留兩個入口（原本的 WORKSPACE 群組）：
+// PROJECTS = 開 session 用的設定；STATION = channel 根目錄的 IDENTITY / SKILLS / … 合成一頁（見 station.js）。
+// ALL SESSIONS 移到 SessionSidebar 的標題列。/station 會 redirect 回上次看的分頁
+const NAV = [
+  { to: '/projects', label: 'PROJECTS', section: 'projects' },
+  { to: '/station', label: 'STATION', section: 'station' },
 ];
 
 const route = useRoute();
@@ -29,33 +27,29 @@ const isLogin = computed(() => route.name === 'login');
 const fullBleed = computed(() => !!route.meta.fullBleed);
 const mainEl = ref(null);
 
-// ───── WORKSPACE 群組：預設收合、記住開合；目前頁面在裡面時自動展開 ─────
+// STATION 的詳細頁（/skills/:slug …）也算在 STATION 裡（router.js 的 meta.section）
 function isIn(item) {
-  const p = route.path;
-  return item.exact ? p === item.to : p === item.to || p.startsWith(`${item.to}/`);
+  return route.meta.section === item.section;
 }
-const inWorkspace = computed(() => WORKSPACE.some(isIn));
-const workspaceOpen = ref(readFlag('codd.workspaceOpen'));
-
-function readFlag(key) {
-  try { return localStorage.getItem(key) === '1'; } catch { return false; }
-}
-function toggleWorkspace() {
-  workspaceOpen.value = !workspaceOpen.value;
-  try { localStorage.setItem('codd.workspaceOpen', workspaceOpen.value ? '1' : '0'); } catch {}
-}
-watch(inWorkspace, (inside) => { if (inside) workspaceOpen.value = true; }, { immediate: true });
 
 // ───── 行動版 top bar ─────
 const currentSession = computed(() =>
   route.name === 'session' ? store.byId(String(route.params.id)) : null);
 const currentState = computed(() => (currentSession.value ? sessionState(currentSession.value) : null));
+// session 標記色：標題前的色點（沒標色就不畫）
+const currentColor = computed(() => colorHex(currentSession.value?.color));
+const currentColorLabel = computed(() => colorMeta(currentSession.value?.color)?.label ?? '');
 
 const pageLabel = computed(() => {
   if (route.name === 'session') return currentSession.value?.title || currentSession.value?.profile_name || 'SESSION';
   if (route.name === 'setup') return 'SETUP';
-  const hit = WORKSPACE.find(isIn);
-  return hit ? hit.label : 'FANCY/CODD';
+  if (route.meta.section === 'projects') return 'PROJECTS';
+  if (route.meta.section === 'station') {
+    const tab = stationTabLabel(stationTabOf(route));
+    return tab ? `STATION · ${tab}` : 'STATION';
+  }
+  if (route.path === '/sessions') return 'ALL SESSIONS';
+  return 'FANCY/CODD';
 });
 
 // ───── 全域行為 ─────
@@ -166,6 +160,13 @@ async function logout() {
       >
         ≡<span v-if="store.waitingCount" class="mb-badge">{{ store.waitingCount }}</span>
       </button>
+      <span
+        v-if="currentColor"
+        class="mb-dot"
+        :style="{ '--dot': currentColor }"
+        role="img"
+        :aria-label="`標記色：${currentColorLabel}`"
+      />
       <span class="mb-title">{{ pageLabel }}</span>
       <span v-if="currentState" class="mb-state" :class="`st-${currentState}`">
         <span class="mb-lamp">{{ STATE_META[currentState].glyph }}</span>{{ STATE_META[currentState].label }}
@@ -185,25 +186,15 @@ async function logout() {
         <SetupGuide v-if="route.name !== 'home' && route.name !== 'setup'" compact class="sb-setup" />
         <SessionSidebar />
 
-        <section class="ws">
-          <button
-            type="button"
-            class="ws-toggle"
-            :class="{ open: workspaceOpen, inside: inWorkspace }"
-            :aria-expanded="workspaceOpen"
-            @click="toggleWorkspace"
-          >
-            <span class="caret">▸</span>WORKSPACE
-          </button>
-          <nav v-show="workspaceOpen" class="nav">
-            <RouterLink
-              v-for="item in WORKSPACE"
-              :key="item.to"
-              :to="item.to"
-              :class="{ on: isIn(item) }"
-            >{{ item.label }}</RouterLink>
-          </nav>
-        </section>
+        <nav class="ws nav" aria-label="主要頁面">
+          <RouterLink
+            v-for="item in NAV"
+            :key="item.to"
+            :to="item.to"
+            :class="{ on: isIn(item) }"
+            :aria-current="isIn(item) ? 'page' : undefined"
+          >{{ item.label }}</RouterLink>
+        </nav>
       </div>
 
       <div class="sb-foot">
@@ -230,3 +221,22 @@ async function logout() {
     </main>
   </div>
 </template>
+
+<style scoped>
+/* PROJECTS / STATION：沿用 styles.css 的 .ws（上方虛線分隔）與 .nav（連結樣式）；
+   .nav 的 padding 會蓋掉 .ws 的 padding-top，這裡補回來 */
+.ws.nav {
+  padding-top: 8px;
+}
+
+/* 行動版 top bar：session 標記色色點（.mobile-bar 的 gap 是 10px，色點要貼近標題） */
+.mb-dot {
+  flex: none;
+  width: 9px;
+  height: 9px;
+  margin-right: -4px;
+  border-radius: 50%;
+  background: var(--dot);
+  box-shadow: 0 0 6px var(--dot);
+}
+</style>

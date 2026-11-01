@@ -4,6 +4,7 @@ import { createWriteStream, mkdirSync, existsSync } from 'node:fs';
 import { resolve, dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { EventEmitter } from 'node:events';
+import { parseColor, sanitizeColor } from './colors.js';
 
 const RING_MAX = 2000;
 // chunk 數之外再限總 bytes：避免大量輸出（例如 cat 大檔）讓單一 session 吃掉幾百 MB
@@ -225,6 +226,8 @@ export class TerminalManager {
       rows: size.rows,
       controller_client_id: null,
       claude_session_id: spawnCmd.claude_session_id,
+      // 標記色：開的時候繼承 project（launch profile）的預設色，之後可以各自改（setColor）
+      color: sanitizeColor(profile.color),
       log_path: logPath,
       output_ring: [],
       _ring_bytes: 0,
@@ -312,9 +315,20 @@ export class TerminalManager {
     const fresh = await this.spawn({ profile_id: s.profile_id, cols: s.cols, rows: s.rows });
     const freshRec = this.sessions.get(fresh.id);
     freshRec.restart_count = (s.restart_count || 0) + 1;
-    // 重開的 session 留在原本的位置
+    // 重開的 session 留在原本的位置，標記色也沿用舊的（包括「已清掉顏色」的 null，不重新繼承 project 色）
     freshRec.order = s.order;
+    freshRec.color = sanitizeColor(s.color);
     return this._toJson(freshRec);
+  }
+
+  // 標記色：color = palette key 或 null（清除）。不合法的值 throw（err.status = 400），不會默默清掉顏色。
+  // 跟 order 一樣只放記憶體（server 重啟後 session 本來就都不在了）。回傳：null = session 不存在
+  setColor(id, color) {
+    const next = parseColor(color);
+    const s = this.sessions.get(id);
+    if (!s) return null;
+    s.color = next;
+    return this._toJson(s);
   }
 
   // 多台裝置看同一個 PTY 時，PTY 尺寸跟著「最後操作的那台」走（controller_client_id）。
@@ -395,6 +409,7 @@ export class TerminalManager {
       rows: s.rows,
       controller_client_id: s.controller_client_id,
       claude_session_id: s.claude_session_id,
+      color: sanitizeColor(s.color),
       output_lines: s.output_ring.length,
     };
   }

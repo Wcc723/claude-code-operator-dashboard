@@ -91,13 +91,13 @@ function fmtWhen(iso) {
 
     <template v-else>
       <h2>FANCY/CODD</h2>
-      <p class="section-meta">NO ACTIVE SESSION · 選一個 profile 開始</p>
+      <p class="section-meta">NO ACTIVE SESSION · 選一個 project 開始</p>
       <p v-if="error" class="error">{{ error }}</p>
 
       <section class="card launch">
         <h3>LAUNCH</h3>
         <p v-if="!store.profiles.length" class="notice">
-          // 還沒有 launch profile — <RouterLink to="/profiles">到 PROFILES 建立一個 →</RouterLink>
+          // 還沒有 project — <RouterLink to="/projects">到 PROJECTS 建立一個 →</RouterLink>
         </p>
         <div v-else class="profiles">
           <button

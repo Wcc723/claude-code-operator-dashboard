@@ -19,6 +19,7 @@ export function openDb(dbPath) {
 
   const schema = readFileSync(resolve(__dirname, 'schema.sql'), 'utf8');
   db.exec(schema);
+  migrate(db);
 
   const columnCount = db.prepare('SELECT COUNT(*) AS c FROM kanban_columns').get().c;
   if (columnCount === 0) {
@@ -41,6 +42,23 @@ export function openDb(dbPath) {
   }
 
   return db;
+}
+
+// schema.sql 全是 CREATE ... IF NOT EXISTS：表已存在時不會補新欄位，舊 DB 要在這裡自己 ALTER。
+// 每一步都要能重跑（先看欄位在不在）。
+function migrate(db) {
+  addColumnIfMissing(db, 'launch_profiles', 'color', 'TEXT');
+}
+
+function addColumnIfMissing(db, table, column, type) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (cols.some((c) => c.name === column)) return;
+  try {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+  } catch (e) {
+    // server 與 MCP（apps/mcp 也呼叫 openDb）同時開同一個舊 DB 時，另一邊可能剛好先加了
+    if (!/duplicate column name/i.test(String(e.message))) throw e;
+  }
 }
 
 export function getDb() {

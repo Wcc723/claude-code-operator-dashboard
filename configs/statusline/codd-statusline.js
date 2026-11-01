@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Claude Code statusLine tap：從 statusline stdin 取 Claude 標題 / context / 5h·1w 用量寫進 STATUS_DIR，
+// Claude Code statusLine tap：從 statusline stdin 取 Claude 標題 / context / 週用量（five_hour 有回就一併記）寫進 STATUS_DIR，
 // 再（可選）把同一份 stdin 交給原本的 statusLine command 去畫。
 //
 //   codd-statusline.js                       → 自己印一行簡短狀態（standalone）
@@ -127,7 +127,8 @@ function writeTerm(statusDir, data) {
   });
 }
 
-// 回傳寫進去的 snapshot（standalone 模式拿來印 5h 剩餘），沒有 rate_limits 就 null
+// 回傳寫進去的 snapshot，沒有 rate_limits 就 null。
+// Claude 已取消 5 小時用量，但 stdin 若還有 five_hour 就照記（讀取端自己決定要不要顯示）
 function writeUsage(statusDir, data) {
   const rl = isObj(data.rate_limits) ? data.rate_limits : null;
   if (!rl) return null;
@@ -170,10 +171,13 @@ function standaloneLine(data) {
   if (model) parts.push(model);
   const ctx = contextLeftPct(data);
   if (ctx !== null) parts.push(`ctx ${Math.round(ctx)}% left`);
-  const five = pickWindow(data.rate_limits?.five_hour);
-  if (five && (five.resets_at === null || five.resets_at * 1000 > Date.now())) {
-    parts.push(`5h ${Math.round(Math.min(100, Math.max(0, 100 - five.used_percentage)))}% left`);
-  }
+  // 剩餘用量：有（未過期的）5h 就印 5h，否則改印週用量 1w
+  const live = (w) => (w && (w.resets_at === null || w.resets_at * 1000 > Date.now()) ? w : null);
+  const left = (w) => Math.round(Math.min(100, Math.max(0, 100 - w.used_percentage)));
+  const five = live(pickWindow(data.rate_limits?.five_hour));
+  const week = five ? null : live(pickWindow(data.rate_limits?.seven_day));
+  if (five) parts.push(`5h ${left(five)}% left`);
+  else if (week) parts.push(`1w ${left(week)}% left`);
   return parts.join(' · ');
 }
 

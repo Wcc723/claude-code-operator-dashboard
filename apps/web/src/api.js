@@ -55,7 +55,7 @@ export const api = {
   // status
   getStatus: () => request('/status'),
 
-  // launch profiles
+  // launch profiles（UI 上叫 Projects；profile 物件多一個 color 欄位）
   listProfiles: () => request('/launch-profiles'),
   getProfile: (id) => request(`/launch-profiles/${id}`),
   createProfile: (data) => request('/launch-profiles', { method: 'POST', body: JSON.stringify(data) }),
@@ -83,9 +83,35 @@ export const api = {
     method: 'POST',
     body: JSON.stringify({ data: base64 }),
   }),
+  // 標記色：color = palette key（見 colors.js）或 null（清除）
+  setSessionColor: (id, color) => request(`/terminal/sessions/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ color }),
+  }),
 
-  // system / device status（含目前帳號的 5h/1w usage）
+  // system / device status（含 statusline 回報的目前帳號用量；沒有 cswap 時的退路）
   getSystem: () => request('/system'),
+
+  // 帳號與用量：Claude（cswap）與 Codex（codex app-server + 本機帳號庫）
+  getClaudeAccounts: ({ refresh = false } = {}) => request(`/accounts/claude${refresh ? '?refresh=1' : ''}`),
+  switchClaudeAccount: (number) => request('/accounts/claude/switch', {
+    method: 'POST',
+    body: JSON.stringify({ number }),
+  }),
+  getCodexAccounts: ({ refresh = false } = {}) => request(`/accounts/codex${refresh ? '?refresh=1' : ''}`),
+  saveCodexAccount: (label) => request('/accounts/codex/save-current', {
+    method: 'POST',
+    body: JSON.stringify({ label: label ?? null }),
+  }),
+  switchCodexAccount: (id) => request('/accounts/codex/switch', {
+    method: 'POST',
+    body: JSON.stringify({ id }),
+  }),
+  renameCodexAccount: (id, label) => request(`/accounts/codex/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ label }),
+  }),
+  removeCodexAccount: (id) => request(`/accounts/codex/${encodeURIComponent(id)}`, { method: 'DELETE' }),
 
   // setup / onboarding（user-level ~/.claude/settings.json hooks + statusLine）
   getSetup: () => request('/setup'),

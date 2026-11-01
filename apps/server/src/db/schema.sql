@@ -28,6 +28,8 @@ CREATE TABLE IF NOT EXISTS launch_profiles (
   command TEXT NOT NULL,
   cwd TEXT NOT NULL,
   env_json TEXT,
+  -- project 標記色（colors.js 的 key 或 NULL）；舊 DB 由 db/index.js 的 migration 補上這欄
+  color TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );

@@ -25,7 +25,7 @@ Fancy CODD 提供兩個可選的「注入式擴充」給 channel：
 | session 在忙 / **等你輸入**（權限確認、AskUserQuestion、plan 核准）/ 閒置 | hooks |
 | Claude 標題（`/rename` 自訂名稱）、最近一次 prompt | hooks（`SessionStart` / `UserPromptSubmit`） |
 | Claude 標題、context 剩餘 % | statusline |
-| 5h / 1w 用量與重置時間 | statusline（`rate_limits`） |
+| 週用量與重置時間（Claude 已取消 5 小時用量；`five_hour` 有回才一併記錄） | statusline（`rate_limits`） |
 
 資料寫在 `STATUS_DIR_PATH`（預設 `~/.claude/codd-status/`）底下的 `term/` 與 `usage/`，server 只讀不寫。
 
@@ -78,7 +78,7 @@ npm run setup -- uninstall                  # 移除
 
 **statusLine**：
 
-- 原本 **沒有** statusline → 裝成 standalone：`if [ -x '<node>' ] && [ -f '<script>' ]; then STATUS_DIR_PATH='…' '<node>' '<repo>/configs/statusline/codd-statusline.js'; else :; fi`，顯示一行簡易狀態（資料夾 · model · ctx · 5h 剩餘）。
+- 原本 **沒有** statusline → 裝成 standalone：`if [ -x '<node>' ] && [ -f '<script>' ]; then STATUS_DIR_PATH='…' '<node>' '<repo>/configs/statusline/codd-statusline.js'; else :; fi`，顯示一行簡易狀態（資料夾 · model · ctx · 剩餘用量：有 5h 印 5h，沒有就印週用量，例如 `1w 98% left`）。
 - 原本 **已有** statusline（例如 RayAgentHub 的 wrapper）→ 裝成 wrapped：then 那段後面加 `--chain-b64 <原指令的 base64>`，else 那段是 `/bin/sh -c '<原指令>'`。CODD 先記錄資料，再把同一份 stdin 交給原指令執行並原樣輸出，**畫面跟原本一模一樣**；node 或 script 不見時直接跑原指令，**原本的 statusline 不會消失**。`padding`、`refreshInterval` 等其他欄位保留。已經包過的不會再包第二層。
 - statusline 對 **每個** session 都會跑（用量要從任何一個 session 取得），只做同步讀寫小檔、不連網。
 

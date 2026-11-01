@@ -40,7 +40,7 @@ async function save() {
 </script>
 
 <template>
-  <RouterLink to="/identity" style="font-size: 13px; letter-spacing: 0.12em; text-transform: uppercase">← back / identity</RouterLink>
+  <RouterLink to="/station/identity" style="font-size: 13px; letter-spacing: 0.12em; text-transform: uppercase">← back / station / identity</RouterLink>
   <h2 v-if="resource" style="margin-top: 12px">{{ resource.name }}</h2>
   <p v-if="resource" class="section-meta">
     IDENTITY · {{ resource.name }} · <code class="path">{{ resource.path }}</code>

@@ -23,12 +23,12 @@ const indexLabel = computed(() => {
 </script>
 
 <template>
+  <!-- 大標題由 STATION 的分頁列負責；這裡只留索引列與 REFRESH -->
   <div class="toolbar">
-    <h2 style="margin: 0">SKILLS</h2>
+    <p class="section-meta" style="margin: 0">{{ indexLabel || 'LOADING…' }}</p>
     <span class="spacer" />
     <RefreshButton :on-refresh="load" />
   </div>
-  <p class="section-meta">{{ indexLabel || 'LOADING…' }}</p>
 
   <p v-if="loading" class="notice">// scanning .claude/skills …</p>
   <p v-else-if="!items.length" class="notice">// no skills found</p>

@@ -1,6 +1,6 @@
 import { Router } from 'express';
 
-// 側欄底部的主機狀態 + 目前帳號的 5h/1w 用量。
+// 側欄底部的主機狀態 + 目前帳號的週用量（statusline 回報；Claude 已取消 5 小時用量，five_hour 有回才會出現）。
 // sampler 是 lazy 的：這個 route 被打到才開始取樣，沒人看 60 s 後自動停。
 export function systemRouter(sampler, insights) {
   const router = Router();

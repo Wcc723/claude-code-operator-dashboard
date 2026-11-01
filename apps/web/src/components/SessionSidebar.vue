@@ -3,6 +3,8 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import { RouterLink, useRoute, useRouter } from 'vue-router';
 import draggable from 'vuedraggable';
 import { useSessionsStore, sessionState, STATE_META } from '../stores/sessions.js';
+import { colorHex, colorMeta } from '../colors.js';
+import ColorPicker from './ColorPicker.vue';
 
 const STOPPED_LIMIT = 12;
 // claude 開起來超過這麼久還沒有任何 hook 回報，才提示（SessionStart 正常幾秒內就會到）
@@ -140,6 +142,7 @@ function onDragStart() {
   dragActive = true;
   dragging.value = true;
   hidePop();
+  closeColorMenu();
 }
 
 function onDragEnd() {
@@ -184,7 +187,8 @@ const popSession = computed(() => (pop.value ? store.byId(pop.value.id) : null))
 const popIdx = computed(() => (pop.value ? store.active.findIndex((x) => x.id === pop.value.id) : -1));
 
 function showPop(e, s) {
-  if (!canHover || dragging.value) return;
+  // 標記色選單開著時不跳 hover 卡片（兩個都在側欄右邊，會疊在一起）
+  if (!canHover || dragging.value || colorMenu.value) return;
   clearTimeout(popTimer);
   const el = e.currentTarget;
   popTimer = setTimeout(async () => {
@@ -210,16 +214,139 @@ function onRowFocus(e, s) {
   else hidePop();
 }
 
-watch(() => route.fullPath, hidePop);
+// ───── 標記色 ─────
+// 色條畫在列的左緣內側（不佔用狀態用的 border-left：current / WAITING 的 amber 邊線語意不變）。
+// 入口是列尾的色塊按鈕：桌機 hover / 鍵盤 focus 時出現，觸控常駐。按鈕是 <li> 裡跟連結並列的兄弟元素
+// （<a> 裡不能放按鈕），也被 draggable 的 filter 排除，所以點它不會切換 session、也不會開始拖曳。
+// hover popover 是 pointer-events: none 的 tooltip，放不了可以點的東西，所以另開一個小浮層（role=dialog）。
+function tagHex(s) {
+  return colorHex(s?.color);
+}
+
+function colorLabel(s) {
+  const m = colorMeta(s?.color);
+  return m ? `${m.label}色` : '未標色';
+}
+
+const colorMenu = ref(null);     // { id, top, left }
+const colorMenuEl = ref(null);
+const colorMenuSession = computed(() => (colorMenu.value ? store.byId(colorMenu.value.id) : null));
+let colorTrigger = null;          // 開啟選單的按鈕：關閉時把焦點還給它
+const colorErr = ref('');
+let colorErrTimer = null;
+
+async function openColorMenu(e, s) {
+  const trigger = e.currentTarget;
+  if (colorMenu.value?.id === s.id) {
+    closeColorMenu(true);
+    return;
+  }
+  hidePop();
+  colorTrigger = trigger;
+  const r = trigger.getBoundingClientRect();
+  colorMenu.value = { id: s.id, top: r.top, left: r.right + 8 };
+  await nextTick();
+  placeColorMenu();
+  // 焦點移到目前選中的色塊（radiogroup 的 roving tabindex），←/→ 直接換色
+  colorMenuEl.value?.querySelector('[role="radio"][tabindex="0"]')?.focus({ preventScroll: true });
+}
+
+// 桌機：放在側欄右邊、對齊這一列（同 hover 卡片）；放不下（手機 drawer）就放按鈕下方（再不行放上方）
+function placeColorMenu() {
+  const m = colorMenu.value;
+  const el = colorMenuEl.value;
+  if (!m || !el || !colorTrigger?.isConnected) return;
+  const pad = 8;
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const box = el.getBoundingClientRect();
+  const btn = colorTrigger.getBoundingClientRect();
+  const row = colorTrigger.closest('li')?.getBoundingClientRect() ?? btn;
+  let left;
+  let top;
+  if (row.right + 10 + box.width <= vw - pad) {
+    left = row.right + 10;
+    top = row.top;
+  } else {
+    left = btn.right - box.width;
+    top = btn.bottom + 6;
+    if (top + box.height > vh - pad) top = btn.top - 6 - box.height;
+  }
+  left = Math.min(Math.max(pad, left), vw - pad - box.width);
+  top = Math.min(Math.max(pad, top), vh - pad - box.height);
+  colorMenu.value = { ...m, top, left };
+}
+
+function closeColorMenu(restoreFocus = false) {
+  if (!colorMenu.value) return;
+  colorMenu.value = null;
+  const t = colorTrigger;
+  colorTrigger = null;
+  if (restoreFocus && t?.isConnected) t.focus({ preventScroll: true });
+}
+
+async function pickColor(id, color) {
+  colorErr.value = '';
+  clearTimeout(colorErrTimer);
+  try {
+    await store.setColor(id, color);
+  } catch (e) {
+    // store 已經把顏色還原了；這裡只負責讓人知道沒存到
+    colorErr.value = `標記色沒存到：${e.message}`;
+    colorErrTimer = setTimeout(() => { colorErr.value = ''; }, 6000);
+  }
+}
+
+// 點色塊（或在色塊上按 Enter / Space）= 選好了，關掉；←/→ 只換色不關
+function onColorMenuClick(e) {
+  if (e.target.closest?.('[role="radio"]')) closeColorMenu(true);
+}
+
+// 浮層 teleport 到 body 最後面，Tab 出去會跑到網址列：Tab / Shift+Tab 一律關掉並回到按鈕（模板裡處理）。
+// 其他方式讓焦點離開浮層也關。relatedTarget 是 null 的不算：Safari 點按鈕不會給按鈕焦點，
+// 點色塊時原本有焦點的色塊會先 blur（relatedTarget = null），這時關掉會把正要點的色塊拆掉
+function onColorMenuFocusOut(e) {
+  if (e.relatedTarget && !colorMenuEl.value?.contains(e.relatedTarget)) closeColorMenu(false);
+}
+
+function onDocPointerDown(e) {
+  if (!colorMenu.value) return;
+  if (colorMenuEl.value?.contains(e.target) || colorTrigger?.contains(e.target)) return; // 按鈕自己的 click 會切換
+  closeColorMenu(false);
+}
+
+function onAnyScroll(e) {
+  hidePop();
+  // 浮層是 fixed 定位，側欄一捲就對不齊了
+  if (colorMenu.value && !colorMenuEl.value?.contains(e.target)) closeColorMenu(false);
+}
+
+function onResize() {
+  closeColorMenu(false);
+}
+
+// 選單開著時那個 session 不見了（被別台裝置移除）：關掉，不要留一個空的浮層狀態
+watch(() => !!colorMenu.value && !colorMenuSession.value, (gone) => { if (gone) closeColorMenu(false); });
+
+watch(() => route.fullPath, () => {
+  hidePop();
+  closeColorMenu(false);
+});
 
 onMounted(() => {
   clock = setInterval(() => { now.value = Date.now(); }, 1000);
-  window.addEventListener('scroll', hidePop, true);
+  window.addEventListener('scroll', onAnyScroll, true);
+  window.addEventListener('resize', onResize);
+  document.addEventListener('pointerdown', onDocPointerDown, true);
 });
 onUnmounted(() => {
   clearInterval(clock);
-  window.removeEventListener('scroll', hidePop, true);
+  clearTimeout(colorErrTimer);
+  window.removeEventListener('scroll', onAnyScroll, true);
+  window.removeEventListener('resize', onResize);
+  document.removeEventListener('pointerdown', onDocPointerDown, true);
   hidePop();
+  closeColorMenu(false);
 });
 </script>
 
@@ -232,7 +359,15 @@ onUnmounted(() => {
       <span v-if="store.waitingCount" class="sec-waiting" :title="`${store.waitingCount} 個 session 在等你`">
         ◆ {{ store.waitingCount }}
       </span>
+      <RouterLink
+        to="/sessions"
+        class="all-link"
+        aria-label="all sessions"
+        title="全部 session 列表（含已停止、已移除的）"
+        @click="onRowClick"
+      >all ›</RouterLink>
     </header>
+    <p v-if="colorErr" class="flash" role="alert">// {{ colorErr }}</p>
 
     <div v-if="!store.loaded" class="skeleton" aria-hidden="true">
       <div v-for="n in 3" :key="n" class="sk-row">
@@ -260,6 +395,8 @@ onUnmounted(() => {
         :force-fallback="true"
         :fallback-tolerance="4"
         :handle="coarse ? '.grip' : null"
+        filter=".cbtn"
+        :prevent-on-filter="false"
         ghost-class="drag-ghost"
         chosen-class="drag-chosen"
         drag-class="drag-float"
@@ -268,7 +405,8 @@ onUnmounted(() => {
         @update:model-value="onReorder"
       >
         <template #item="{ element: s }">
-          <li class="active-item" @click.capture="swallowClickAfterDrag">
+          <li class="active-item" :class="{ tagged: !!tagHex(s) }" @click.capture="swallowClickAfterDrag">
+            <span v-if="tagHex(s)" class="cbar" :style="{ '--tag': tagHex(s) }" aria-hidden="true" />
             <span class="grip" aria-hidden="true" title="拖曳調整順序">⠿</span>
             <RouterLink
               :to="`/sessions/${s.id}`"
@@ -292,6 +430,7 @@ onUnmounted(() => {
                 <span class="state" :aria-hidden="stateOf(s) === 'unknown' ? 'true' : undefined">{{ STATE_META[stateOf(s)].label }}</span>
                 <span v-if="stateOf(s) === 'unknown'" class="sr-only">UNKNOWN</span>
               </span>
+              <span v-if="s.color" class="sr-only">標記：{{ colorLabel(s) }}</span>
               <span v-if="s.last_prompt" class="sr-only">最近 prompt：{{ s.last_prompt }}</span>
               <span class="line2">
                 <span class="cwd"><span dir="ltr">{{ shortPath(s) }}</span></span>
@@ -305,6 +444,17 @@ onUnmounted(() => {
               </span>
               <span v-if="noHook(s)" class="sr-only">{{ NO_HOOK_TITLE }}</span>
             </RouterLink>
+            <button
+              type="button"
+              class="cbtn"
+              :class="{ open: colorMenu?.id === s.id }"
+              :style="tagHex(s) ? { '--tag': tagHex(s) } : null"
+              :title="`標記色：${colorLabel(s)}`"
+              :aria-label="`${titleOf(s)} 的標記色（${colorLabel(s)}）`"
+              aria-haspopup="dialog"
+              :aria-expanded="colorMenu?.id === s.id"
+              @click="openColorMenu($event, s)"
+            ><span class="cdot" :class="{ none: !tagHex(s) }" aria-hidden="true" /></button>
           </li>
         </template>
       </draggable>
@@ -316,6 +466,7 @@ onUnmounted(() => {
         </button>
         <ul v-if="stoppedVisible" class="rows" role="list">
           <li v-for="s in stoppedShown" :key="s.id" class="stopped-item">
+            <span v-if="tagHex(s)" class="cbar" :style="{ '--tag': tagHex(s) }" aria-hidden="true" />
             <RouterLink
               :to="`/sessions/${s.id}`"
               class="srow st-ended has-rm"
@@ -327,6 +478,7 @@ onUnmounted(() => {
                 <span class="lamp" aria-hidden="true">✕</span>
                 <span class="title">{{ titleOf(s) }}</span>
               </span>
+              <span v-if="s.color" class="sr-only">標記：{{ colorLabel(s) }}</span>
               <span class="line2">
                 <span class="cwd"><span dir="ltr">{{ shortPath(s) }}</span></span>
                 <span class="times"><span class="t-up">{{ fmtClock(s.exited_at) }}</span></span>
@@ -377,6 +529,30 @@ onUnmounted(() => {
         </div>
         <div class="pop-hint">拖曳或 Alt+Shift+↑↓ 調整順序</div>
       </div>
+
+      <div
+        v-if="colorMenu && colorMenuSession"
+        ref="colorMenuEl"
+        class="color-menu"
+        role="dialog"
+        :aria-label="`${titleOf(colorMenuSession)} 的標記色`"
+        :style="{ top: `${colorMenu.top}px`, left: `${colorMenu.left}px` }"
+        @keydown.esc.stop.prevent="closeColorMenu(true)"
+        @keydown.tab.prevent="closeColorMenu(true)"
+        @focusout="onColorMenuFocusOut"
+        @click="onColorMenuClick"
+      >
+        <div class="cm-head">
+          <span class="cm-label">標記色</span>
+          <span class="cm-title">{{ titleOf(colorMenuSession) }}</span>
+        </div>
+        <ColorPicker
+          :model-value="colorMenuSession.color ?? null"
+          :label="`${titleOf(colorMenuSession)} 的標記色`"
+          @change="pickColor(colorMenuSession.id, $event)"
+        />
+        <div v-if="!coarse" class="cm-hint">←/→ 換色 · Enter 確定 · Esc 關閉</div>
+      </div>
     </Teleport>
   </section>
 </template>
@@ -412,6 +588,26 @@ onUnmounted(() => {
   box-shadow: 0 0 10px var(--amber-glow);
 }
 .spacer { flex: 1; }
+/* 取代原本 WORKSPACE 裡的 ALL SESSIONS；負 margin 撐大點擊區但不撐高標題列 */
+.all-link {
+  flex: none;
+  padding: 6px 2px;
+  margin: -6px 0;
+  border-bottom: none;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: var(--dim);
+  white-space: nowrap;
+}
+.all-link:hover,
+.all-link.router-link-exact-active { color: var(--amber); }
+.all-link:focus-visible { outline: 1px solid var(--amber-dim); outline-offset: 0; }
+.flash {
+  margin: -2px 4px 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--danger);
+}
 
 .rows {
   list-style: none;
@@ -453,7 +649,9 @@ onUnmounted(() => {
   border-left-width: 2px;
 }
 .drag-ghost > .srow > *,
-.drag-ghost > .grip { visibility: hidden; }
+.drag-ghost > .grip,
+.drag-ghost > .cbar,
+.drag-ghost > .cbtn { visibility: hidden; }
 /* 跟著游標 / 手指走的那份 */
 .drag-float {
   opacity: 0.95 !important;
@@ -674,6 +872,116 @@ onUnmounted(() => {
 .more a { border-bottom: none; color: var(--dim); letter-spacing: 0.06em; }
 .more a:hover { color: var(--amber); }
 
+/* ───── 標記色 ───── */
+/* 色條在 2px 狀態邊線（current / WAITING 的 amber）右邊，兩者並存、互不覆蓋；
+   放在 .grip 前面，桌機 hover 時把手的點點疊在色條上 */
+.cbar {
+  position: absolute;
+  z-index: 1;
+  top: 6px;
+  bottom: 6px;
+  left: 3px;
+  width: 3px;
+  border-radius: 2px;
+  background: var(--tag);
+  pointer-events: none;
+}
+.stopped-item .cbar { opacity: 0.5; }
+
+/* 桌機：hover / 鍵盤 focus 到這列才出現，蓋在第二行右邊的時間上（hover 卡片裡也有時間） */
+.cbtn {
+  position: absolute;
+  z-index: 2;
+  right: 4px;
+  bottom: 5px;
+  width: 24px;
+  height: 20px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line-bright);
+  background: var(--bg-lift);
+  letter-spacing: 0;
+  opacity: 0;
+  transition: opacity 90ms;
+}
+.cbtn::before,
+.cbtn::after { content: none; }
+/* :focus-visible 而不是 :focus-within：滑鼠點進 session 後連結會留著焦點，不該一直露出按鈕 */
+.active-item:hover .cbtn,
+.active-item:has(:focus-visible) .cbtn,
+.cbtn.open { opacity: 1; }
+.rows.is-dragging .active-item .cbtn { opacity: 0; }
+.cbtn:hover {
+  border-color: var(--amber-dim);
+  box-shadow: none;
+}
+.cbtn:focus-visible {
+  opacity: 1;
+  outline: 1px solid var(--amber);
+  outline-offset: 1px;
+}
+.cdot {
+  display: block;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  background: var(--tag);
+}
+.cdot.none {
+  background: transparent;
+  border: 1px dashed var(--dimmer);
+}
+
+.color-menu {
+  position: fixed;
+  z-index: 210;
+  /* 寬度不能跟著 left 縮：一開始先放在按鈕右邊量尺寸，靠右時會被擠窄、量到錯的寬度 */
+  width: max-content;
+  max-width: calc(100vw - 16px);
+  padding: 10px 12px;
+  background: var(--bg-soft);
+  border: 1px solid var(--line-bright);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.7), 0 0 0 1px rgba(0, 0, 0, 0.6);
+  animation: pop-in 120ms ease-out;
+}
+.cm-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  margin-bottom: 8px;
+}
+.cm-label {
+  flex: none;
+  font-size: 10.5px;
+  letter-spacing: 0.14em;
+  color: var(--dim);
+}
+.cm-title {
+  min-width: 0;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--bone);
+}
+.cm-hint {
+  margin-top: 8px;
+  font-size: 10.5px;
+  color: var(--dimmer);
+  letter-spacing: 0.04em;
+}
+@media (hover: none) {
+  .cbtn { opacity: 0.85; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cbtn { transition: none; }
+  .color-menu { animation: none; }
+}
+
 /* ───── Empty / skeleton ───── */
 .empty {
   margin: 4px 4px 0;
@@ -716,7 +1024,21 @@ onUnmounted(() => {
     touch-action: none;
     -webkit-touch-callout: none;
   }
-  .active-item > .srow { padding-left: 32px; }
+  .active-item > .srow { padding-left: 32px; padding-right: 44px; }
+  /* 觸控：色塊按鈕常駐在列尾，40px 點擊區；列尾這塊不再是進入 session 的連結 */
+  .cbtn {
+    top: 50%;
+    bottom: auto;
+    right: 2px;
+    width: 40px;
+    height: 40px;
+    transform: translateY(-50%);
+    border-color: transparent;
+    background: transparent;
+    opacity: 0.85;
+  }
+  .cdot { width: 14px; height: 14px; }
+  .all-link { padding: 10px 4px; margin: -10px 0; font-size: 12px; }
   .toggle { min-height: 40px; }
   .rm { width: 40px; height: 40px; opacity: 0.8; }
   .srow.has-rm { padding-right: 48px; }

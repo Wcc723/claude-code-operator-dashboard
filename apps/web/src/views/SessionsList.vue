@@ -1,8 +1,10 @@
 <script setup>
-import { ref, onMounted, computed } from 'vue';
+import { ref, onMounted, computed, nextTick } from 'vue';
 import { useRouter } from 'vue-router';
 import { api } from '../api.js';
 import { useSessionsStore, sessionState, STATE_META } from '../stores/sessions.js';
+import { colorHex, colorMeta } from '../colors.js';
+import ColorPicker from '../components/ColorPicker.vue';
 
 const router = useRouter();
 const store = useSessionsStore();
@@ -78,6 +80,55 @@ function stateOf(s) {
   return sessionState(s);
 }
 
+// ───── 標記色 ─────
+// 這頁的列表是自己抓的一份；顏色以 sessions store 為準（側欄 / 頁首剛改的、還在送的樂觀值都會即時反映）
+function colorOf(s) {
+  const live = store.byId(s.id);
+  return (live ? live.color : s.color) ?? null;
+}
+function colorLabel(s) {
+  const m = colorMeta(colorOf(s));
+  return m ? `${m.label}色` : '未標色';
+}
+const colorFor = ref(null); // 展開色盤的 session id（一次只開一列）
+
+async function toggleColor(s) {
+  colorFor.value = colorFor.value === s.id ? null : s.id;
+  if (!colorFor.value) return;
+  await nextTick();
+  document.querySelector(`.tag-row[data-sid="${s.id}"] [role="radio"][tabindex="0"]`)?.focus({ preventScroll: true });
+}
+
+function closeColor(s) {
+  colorFor.value = null;
+  nextTick(() => document.querySelector(`.tag-btn[data-sid="${s.id}"]`)?.focus({ preventScroll: true }));
+}
+
+async function pickColor(s, color) {
+  const before = s.color ?? null;
+  s.color = color;
+  error.value = null;
+  try {
+    await store.setColor(s.id, color);
+  } catch (e) {
+    s.color = before;
+    error.value = `標記色沒存到：${e.message}`;
+  }
+}
+
+// 點色塊（或 Enter / Space）= 選好了；←/→ 只換色
+function onTagRowClick(e, s) {
+  if (e.target.closest?.('[role="radio"]')) closeColor(s);
+}
+
+// 這一列整列是 role=button（Enter / Space = 進入 session）：色盤裡的按鍵不能冒泡上去
+function onTagRowKeydown(e, s) {
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    closeColor(s);
+  }
+}
+
 function runtime(s) {
   if (!s.started_at) return '—';
   const start = Date.parse(s.started_at);
@@ -115,13 +166,15 @@ function runtime(s) {
       v-for="s in visibleSessions"
       :key="s.id"
       class="list-item clickable"
-      :class="{ removed: s.removed }"
+      :class="{ removed: s.removed, tagged: !!colorHex(colorOf(s)) }"
+      :style="colorHex(colorOf(s)) ? { '--tag': colorHex(colorOf(s)) } : null"
       role="button"
       tabindex="0"
       @click="enter(s.id)"
       @keydown.enter="enter(s.id)"
       @keydown.space.prevent="enter(s.id)"
     >
+      <span v-if="colorHex(colorOf(s))" class="cbar" aria-hidden="true" />
       <div class="row">
         <span :class="['lamp', `st-${stateOf(s)}`]">{{ STATE_META[stateOf(s)].glyph }}</span>
         <strong :title="s.last_prompt ? `最近 prompt：${s.last_prompt}` : undefined">{{ s.title || s.profile_name }}</strong>
@@ -134,6 +187,17 @@ function runtime(s) {
         <span class="chip">run: {{ runtime(s) }}</span>
         <span v-if="s.restart_count" class="chip">restarts: {{ s.restart_count }}</span>
         <span class="spacer" />
+        <button
+          type="button"
+          class="tag-btn"
+          :data-sid="s.id"
+          :title="`標記色：${colorLabel(s)}`"
+          :aria-label="`${s.title || s.profile_name || s.id.slice(0, 8)} 的標記色（${colorLabel(s)}）`"
+          :aria-expanded="colorFor === s.id"
+          @click.stop="toggleColor(s)"
+          @keydown.enter.stop
+          @keydown.space.stop
+        ><span class="tag-dot" :class="{ none: !colorHex(colorOf(s)) }" aria-hidden="true" /></button>
         <button v-if="s.status === 'running'" @click.stop="kill(s.id)" class="danger">KILL</button>
         <button @click.stop="restart(s.id)">RESTART</button>
         <button v-if="!s.removed" @click.stop="remove(s.id)" class="danger">REMOVE</button>
@@ -141,6 +205,20 @@ function runtime(s) {
       <div class="meta">
         <span v-if="s.cwd_short || s.cwd" class="cwd">{{ s.cwd_short || s.cwd }}</span>
         → <code>{{ s.command }}</code>
+      </div>
+      <div
+        v-if="colorFor === s.id"
+        class="tag-row"
+        :data-sid="s.id"
+        @click.stop="onTagRowClick($event, s)"
+        @keydown.stop="onTagRowKeydown($event, s)"
+      >
+        <span class="tag-label">標記色</span>
+        <ColorPicker
+          :model-value="colorOf(s)"
+          :label="`${s.title || s.profile_name || s.id.slice(0, 8)} 的標記色`"
+          @change="pickColor(s, $event)"
+        />
       </div>
     </div>
   </div>
@@ -185,4 +263,57 @@ function runtime(s) {
 .chip.state { border-color: currentColor; text-transform: uppercase; }
 .chip.state.st-waiting { background: var(--amber); border-color: var(--amber); color: #000; }
 .cwd { color: var(--dim); margin-right: 10px; }
+
+/* ───── 標記色 ───── */
+/* 左緣 3px 色條，蓋在 1px 邊框上（這頁沒有狀態色的左邊線，不會互相蓋到） */
+.cbar {
+  position: absolute;
+  top: -1px;
+  bottom: -1px;
+  left: -1px;
+  width: 3px;
+  background: var(--tag);
+  pointer-events: none;
+}
+.tag-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  min-height: 32px;
+  padding: 0;
+  letter-spacing: 0;
+}
+.tag-btn::before,
+.tag-btn::after { content: none; }
+.tag-btn[aria-expanded='true'] { border-color: var(--amber-dim); }
+.tag-dot {
+  display: block;
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  background: var(--tag);
+}
+.tag-dot.none {
+  background: transparent;
+  border: 1px dashed var(--dimmer);
+}
+.tag-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--line-bright);
+  cursor: default;
+}
+.tag-label {
+  font-size: 11.5px;
+  letter-spacing: 0.16em;
+  color: var(--dim);
+}
+@media (pointer: coarse) {
+  .tag-btn { width: 40px; min-height: 40px; }
+}
 </style>

@@ -410,7 +410,7 @@ function installStatusline(settings, ctx) {
   const summary = info.state === 'outdated'
     ? '更新 CODD statusline 的 node / repo 路徑（原本串接的 statusline 不變）'
     : info.chain != null
-      ? '用 CODD statusline 包住你現有的 statusline：畫面輸出仍是原本那支，CODD 只在旁邊記錄標題與 5h/1w 用量'
+      ? '用 CODD statusline 包住你現有的 statusline：畫面輸出仍是原本那支，CODD 只在旁邊記錄標題與週用量'
       : '新增 CODD statusline（目前沒有 statusline，會顯示一行簡易狀態）';
   return { summary, before: { statusLine: before }, after: { statusLine: clone(next) } };
 }

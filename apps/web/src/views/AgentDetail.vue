@@ -26,7 +26,7 @@ async function save(payload) {
 </script>
 
 <template>
-  <RouterLink to="/agents" style="font-size: 13px; letter-spacing: 0.12em; text-transform: uppercase">← back / agents</RouterLink>
+  <RouterLink to="/station/agents" style="font-size: 13px; letter-spacing: 0.12em; text-transform: uppercase">← back / station / agents</RouterLink>
   <h2 v-if="resource" style="margin-top: 12px">{{ resource.frontmatter.name || resource.slug }}</h2>
   <p v-if="resource" class="section-meta">
     AGENT · {{ resource.slug }} · <code class="path">{{ resource.path }}</code>

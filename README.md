@@ -6,6 +6,10 @@
 
 | 模組 | 內容 |
 |---|---|
+| 🖥️ Sessions | 側欄列出這個 app 開的 Claude Code session（狀態燈、拖曳排序、Alt+1..9），每個 session 可各自設標記色 |
+| 📁 Projects | 開 session 的設定（資料夾 + 指令 + env），可設預設標記色，新開的 session 會繼承 |
+| 🛰️ Station | 常駐 agent 的基地台：Identity / Skills / Agents / Tasks / Memory / Kanban 合在一頁，用分頁切換 |
+| 📊 用量與帳號 | 側欄底部顯示 Claude（cswap）與 Codex 的週用量，可展開看所有帳號並一鍵切換 |
 | 📚 Skills | 列出 `$CHANNEL_PATH/.claude/skills/*/SKILL.md`，可線上編輯 frontmatter + body |
 | 🤖 Agents | 列出 `.claude/agents/*.md`，可編輯 |
 | ⏰ Tasks | 列出 `tasks/*.md`，可編輯 cron / prompt（不重啟 cron） |
@@ -24,8 +28,8 @@ flowchart TB
   CF["Cloudflare Named Tunnel — HTTPS"]
 
   subgraph WEB["apps/web — Vite + Vue 3 SPA"]
-    Views["Views: Identity · Skills · Agents · Tasks<br/>Memory · Kanban · Sessions · Profiles"]
-    Pulse["StatusPulse 元件"]
+    Views["Views: Projects · Sessions<br/>Station（Identity · Skills · Agents · Tasks · Memory · Kanban）"]
+    Pulse["DeviceStatus + UsagePanel（主機狀態、帳號用量與切換）"]
     Term["SessionDetail — xterm.js + SSE"]
     Api["api.js · auth store"]
   end
@@ -171,9 +175,23 @@ npm run tunnel    # cloudflared 起 named tunnel（需先按 configs/cloudflared
 
 建議用 launchd / systemd / pm2 讓兩個 process 都自動啟動。
 
+## 帳號用量與切換（Claude / Codex）
+
+側欄底部的 USAGE 區顯示目前 Claude 與 Codex 帳號的**週用量**剩餘（Claude 已取消 5 小時用量，所以只列 1w 與各模型的週額度，例如 Fable；細刻度標出「照進度現在應該剩多少」）。點帳號名稱會展開所有帳號的用量，按「切換」→「確定」即可切換。
+
+| Provider | 資料來源 | 切換方式 |
+|---|---|---|
+| **Claude** | `cswap`（claude-swap）的 `cswap list --json`（server 快取 20 秒） | `cswap switch <編號>`；切換後新開的 session 用新帳號，執行中的建議重開 |
+| **Codex** | `codex app-server` 的 `account/rateLimits/read`（目前帳號 60 秒、其他帳號 10 分鐘探測一次） | 本機帳號庫：把每個帳號的 `auth.json` 存在 `~/.fancy-codd/codex-accounts/`（目錄 0700、檔案 0600），切換時先把目前帳號存回帳號庫、備份原檔，再原子替換 `~/.codex/auth.json` |
+
+- 沒裝 `cswap` 時退回 statusline 回報的目前帳號週用量，並提示安裝；沒裝 Codex CLI 時 CODEX 區塊自動隱藏。
+- **加入第二個 Codex 帳號**：先在面板按「加入帳號庫」存下目前帳號，再到主機上執行 `codex login`（沒有瀏覽器就用 `codex login --device-auth`）登入另一個帳號，回到面板按 ↻ 後再按「加入帳號庫」。**不要先跑 `codex logout`**：它會到 OpenAI 撤銷目前的登入，帳號庫裡存的那份也會跟著失效。
+- 任何 API 回應、log、錯誤訊息都不含 token；畫面預設只顯示 alias 或遮罩過的 email（完整 email 只在滑鼠提示裡）。
+- server 可能由 launchd 啟動、PATH 不完整，所以會依序找 `CSWAP_BIN` / `CODEX_BIN` → PATH → `~/.local/bin` → `/opt/homebrew/bin` → `/usr/local/bin`（Codex 另找 Codex.app / ChatGPT.app 內附的 CLI）。其他選填環境變數見 `.env.example`（`CODEX_HOME`、`CODD_CODEX_VAULT`）。
+
 ## 接上 Claude Code 狀態（hooks + statusline）
 
-側欄的 session 狀態（忙碌 / 等你輸入 / 閒置）、Claude 標題、最近一次 prompt，以及底部的 5h / 1w 用量，都來自 Claude Code 自己回報的資料。要拿到這些資料，得在 **跑 server 的那台機器（Mac mini）** 的 user-level `~/.claude/settings.json` 裝上 CODD 的 hooks 與 statusline。第一次打開網頁時首頁會引導你到 `/setup`（勾選 → 預覽 → 一鍵安裝），也可以用 CLI：
+側欄的 session 狀態（忙碌 / 等你輸入 / 閒置）、Claude 標題、最近一次 prompt，以及沒有 cswap 時底部的週用量，都來自 Claude Code 自己回報的資料。要拿到這些資料，得在 **跑 server 的那台機器（Mac mini）** 的 user-level `~/.claude/settings.json` 裝上 CODD 的 hooks 與 statusline。第一次打開網頁時首頁會引導你到 `/setup`（勾選 → 預覽 → 一鍵安裝），也可以用 CLI：
 
 ```bash
 npm run setup -- status                # 看目前狀態（不寫檔）
@@ -185,7 +203,7 @@ npm run setup -- uninstall             # 移除 hooks，statusline 還原成原�
 | 部分 | 裝了什麼 | 用途 |
 |---|---|---|
 | **hooks** | `SessionStart` / `UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `PostToolUseFailure` / `PermissionRequest` / `Notification` / `Stop` / `StopFailure` / `SessionEnd` 各加一組 `configs/hooks/status-writer.js` | session 狀態（busy / 等待輸入 / idle）、自訂標題、最近 prompt |
-| **statusline** | `statusLine.command` 換成 `configs/statusline/codd-statusline.js` | Claude 標題、context 剩餘、5h / 1w 用量 |
+| **statusline** | `statusLine.command` 換成 `configs/statusline/codd-statusline.js` | Claude 標題、context 剩餘、目前帳號的週用量 |
 | **legacy** | 移除 `CHANNEL_PATH/.claude/settings.json` 裡舊的 channel 級 PostToolUse hook | 避免和新的 hook 重複觸發 |
 
 重點：
