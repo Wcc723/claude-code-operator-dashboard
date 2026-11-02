@@ -9,6 +9,7 @@ const sysSeenAt = new WeakMap();
 // 點帳號列展開 AccountsPopover：看所有帳號的用量、切換帳號。
 // Claude 已取消 5 小時用量：這裡不畫 5h（Codex 回報的 5h 是它真的限制，照列）。
 // 沒有 cswap 時退回 statusline 回報的目前帳號 1w（sessions store 的 /api/system）。
+// 標題列的 ⋯ 可以選要顯示哪些列（lib/usage-prefs.js，存在這台裝置；預設藏 Fable），展開的浮層一律列出全部。
 import { computed, onMounted, onUnmounted, ref, toRaw, watch } from 'vue';
 import { RouterLink, useRoute } from 'vue-router';
 import { useAccountsStore } from '../stores/accounts.js';
@@ -19,6 +20,7 @@ import {
   accountName, accountTitle, activeAccount, ageSeconds, codexHidden, dedupeResets, isStale,
   relTime, splitClaudeWindows, usageWindow,
 } from '../lib/usage-format.js';
+import { isUsageShown, setUsageShown, usagePrefKey } from '../lib/usage-prefs.js';
 
 const accounts = useAccountsStore();
 const sessions = useSessionsStore();
@@ -56,11 +58,14 @@ const claudePayload = computed(() => accounts.claude.payload);
 const claudeOk = computed(() => claudePayload.value?.available === true);
 const claudeActive = computed(() => (claudeOk.value ? activeAccount(claudePayload.value) : null));
 const claudeAge = computed(() => ageSeconds(claudeActive.value?.usage_age_seconds, accounts.claude.lastFetchedAt, now.value));
-const claudeRows = computed(() => {
+const claudeAllRows = computed(() => {
   const a = claudeActive.value;
   if (!a) return [];
-  return dedupeResets(splitClaudeWindows(a).main.map((w) => usageWindow(w, now.value)));
+  return splitClaudeWindows(a).main.map((w) => usageWindow(w, now.value));
 });
+// 先拿掉使用者藏起來的列，再省略重複的重置行：重置時間要留在第一個看得到的列上
+const visible = (provider, rows) => dedupeResets(rows.filter((r) => isUsageShown(usagePrefKey(provider, r))));
+const claudeRows = computed(() => visible('claude', claudeAllRows.value));
 // cswap 找不到使用中的帳號：可能是剛裝還沒 add、或目前登入不是 cswap 管的帳號（例如 /login 換過）。
 // payload 分不出「真的沒登入」，所以不寫「未登入」
 const claudeNote = computed(() => {
@@ -74,9 +79,10 @@ const claudeNote = computed(() => {
 // 退路：cswap 不能用、/api/accounts 打不到（舊版 server），或 cswap 可用但找不到使用中的帳號
 // → statusline 回報的目前帳號 1w（不顯示 5h）。cswap 可用時仍是 'accounts' 模式（帳號列照樣可以點開切換），只借用量列
 const fallbackUsage = computed(() => (claudeOk.value && claudeActive.value ? null : sys.value?.usage ?? null));
-const fallbackRows = computed(() => (fallbackUsage.value
+const fallbackAllRows = computed(() => (fallbackUsage.value
   ? [usageWindow(fallbackUsage.value.seven_day ?? null, now.value, { key: '1w', label: '1w' })]
   : []));
+const fallbackRows = computed(() => visible('claude', fallbackAllRows.value));
 const fallbackAge = computed(() => ageSeconds(fallbackUsage.value?.age_seconds, sysReceivedAt.value, now.value));
 const fallbackName = computed(() => {
   const k = fallbackUsage.value?.config_key;
@@ -97,11 +103,12 @@ const claudeMode = computed(() => {
 const codexPayload = computed(() => accounts.codex.payload);
 const codexActive = computed(() => activeAccount(codexPayload.value));
 const codexAge = computed(() => ageSeconds(codexActive.value?.usage_age_seconds, accounts.codex.lastFetchedAt, now.value));
-const codexRows = computed(() => {
+const codexAllRows = computed(() => {
   const a = codexActive.value;
   if (!a || !Array.isArray(a.windows)) return [];
-  return dedupeResets(a.windows.map((w) => usageWindow(w, now.value)));
+  return a.windows.map((w) => usageWindow(w, now.value));
 });
+const codexRows = computed(() => visible('codex', codexAllRows.value));
 const codexNote = computed(() => {
   const a = codexActive.value;
   // 沒有目前帳號時，server 的 error 會寫原因（例如 keyring 裡的憑證失效或已登出）
@@ -158,6 +165,41 @@ async function refreshAll() {
   }
 }
 
+// ── 選擇要顯示的列 ───────────────────────────────────
+// 選項取自目前收到的資料：所有帳號出現過的視窗（各帳號的 model 視窗可能不一樣），依原本的順序
+const pickGroups = computed(() => {
+  const groups = [];
+  const collect = (provider, title, windows) => {
+    const seen = new Map();
+    for (const w of windows) {
+      const pk = usagePrefKey(provider, w);
+      if (!seen.has(pk)) seen.set(pk, { pk, label: w.label ?? w.key ?? '?' });
+    }
+    if (seen.size) groups.push({ provider, title, options: [...seen.values()] });
+  };
+  if (claudeMode.value === 'accounts' || claudeMode.value === 'fallback') {
+    const list = Array.isArray(claudePayload.value?.accounts) ? claudePayload.value.accounts : [];
+    collect('claude', 'CLAUDE', [
+      ...list.flatMap((a) => splitClaudeWindows(a).main),
+      ...(fallbackUsage.value ? [{ key: '1w', label: '1w' }] : []),
+    ]);
+  }
+  if (codexMode.value === 'accounts') {
+    const list = Array.isArray(codexPayload.value?.accounts) ? codexPayload.value.accounts : [];
+    collect('codex', 'CODEX', list.flatMap((a) => (Array.isArray(a.windows) ? a.windows : [])));
+  }
+  return groups;
+});
+const picking = ref(false);
+const pickBtn = ref(null);
+function closePick(restoreFocus = false) {
+  if (!picking.value) return;
+  picking.value = false;
+  if (restoreFocus && pickBtn.value?.isConnected) pickBtn.value.focus();
+}
+// 沒有選項（資料還沒來、全部不可用）就收起來
+watch(() => pickGroups.value.length, (n) => { if (!n) closePick(false); });
+
 // ── 展開浮層 ─────────────────────────────────────────
 const open = ref(null); // 'claude' | 'codex' | null
 const claudeBtn = ref(null);
@@ -175,8 +217,8 @@ function close(restoreFocus = false) {
 }
 
 // 換頁、手機 drawer 收起來、對應區塊不見了（例如 Codex 變成不可用）→ 浮層一起關，不要留在畫面上
-watch(() => route.fullPath, () => close(false));
-watch(() => sessions.drawerOpen, (isOpen) => { if (!isOpen) close(false); });
+watch(() => route.fullPath, () => { close(false); closePick(false); });
+watch(() => sessions.drawerOpen, (isOpen) => { if (!isOpen) { close(false); closePick(false); } });
 watch([claudeMode, codexMode], ([c, x]) => {
   if ((open.value === 'claude' && c !== 'accounts') || (open.value === 'codex' && x !== 'accounts')) close(false);
 });
@@ -201,6 +243,40 @@ watch([claudeMode, codexMode], ([c, x]) => {
         :class="{ stale: headStale }"
         :title="headStale ? '超過 30 分鐘沒有新的用量資料' : '最近一次收到用量資料'"
       >{{ relTime(headAge) }}</span>
+      <button
+        v-if="pickGroups.length"
+        ref="pickBtn"
+        type="button"
+        class="u-pick-btn"
+        :class="{ on: picking }"
+        :aria-expanded="picking"
+        aria-controls="usage-pick"
+        aria-label="選擇側欄要顯示的用量"
+        title="選擇側欄要顯示的用量"
+        @click="picking = !picking"
+      ><span class="glyph" aria-hidden="true">⋯</span></button>
+    </div>
+
+    <div
+      v-if="picking"
+      id="usage-pick"
+      class="u-pick"
+      role="group"
+      aria-label="側欄要顯示的用量"
+      @keydown.esc.stop="closePick(true)"
+    >
+      <div v-for="g in pickGroups" :key="g.provider" class="pk-group">
+        <span class="p-tag">{{ g.title }}</span>
+        <label v-for="o in g.options" :key="o.pk" class="pk-opt">
+          <input
+            type="checkbox"
+            :checked="isUsageShown(o.pk)"
+            @change="setUsageShown(o.pk, $event.target.checked)"
+          >
+          <span>{{ o.label }}</span>
+        </label>
+      </div>
+      <p class="pk-note">只影響這台裝置；點帳號展開仍看得到全部</p>
     </div>
 
     <div class="p-grid">
@@ -226,8 +302,10 @@ watch([claudeMode, codexMode], ([c, x]) => {
           <span class="caret" aria-hidden="true">{{ open === 'claude' ? '▴' : '▾' }}</span>
         </button>
         <UsageRows v-if="claudeRows.length" :rows="claudeRows" sub />
-        <template v-else-if="!claudeActive && fallbackRows.length">
-          <UsageRows :rows="fallbackRows" sub />
+        <!-- 有資料但全部被藏起來：只留帳號列 -->
+        <template v-else-if="claudeAllRows.length" />
+        <template v-else-if="!claudeActive && fallbackAllRows.length">
+          <UsageRows v-if="fallbackRows.length" :rows="fallbackRows" sub />
           <p class="p-note" :title="claudeNote">{{ claudeNote }}</p>
         </template>
         <p v-else class="p-note">{{ claudeNote }}</p>
@@ -243,7 +321,7 @@ watch([claudeMode, codexMode], ([c, x]) => {
           <span class="p-tag">CLAUDE</span>
           <span v-if="fallbackName" class="p-name">{{ fallbackName }}</span>
         </div>
-        <UsageRows :rows="fallbackRows" sub />
+        <UsageRows v-if="fallbackRows.length" :rows="fallbackRows" sub />
         <p v-if="cswapMissing" class="p-note" :title="claudePayload?.error || ''">安裝 cswap 才能切換帳號</p>
       </div>
 
@@ -280,7 +358,7 @@ watch([claudeMode, codexMode], ([c, x]) => {
           <span class="caret" aria-hidden="true">{{ open === 'codex' ? '▴' : '▾' }}</span>
         </button>
         <UsageRows v-if="codexRows.length" :rows="codexRows" sub />
-        <p v-else-if="codexNote" class="p-note">{{ codexNote }}</p>
+        <p v-else-if="codexNote && !codexAllRows.length" class="p-note">{{ codexNote }}</p>
         <p v-if="mutationError('codex')" class="p-err" role="alert" :title="mutationError('codex')">
           <span class="p-err-text">{{ mutationError('codex') }}</span>
           <button type="button" class="p-x" aria-label="關閉這則錯誤" @click="accounts.clearMutationError('codex')">✕</button>
@@ -328,8 +406,9 @@ watch([claudeMode, codexMode], ([c, x]) => {
 }
 .fresh.stale { color: var(--amber-dim); }
 
-/* ↻：不要全域 button 的 [ ] 與發光 */
-.u-refresh {
+/* ↻、⋯：不要全域 button 的 [ ] 與發光 */
+.u-refresh,
+.u-pick-btn {
   margin-left: auto;
   width: 22px;
   height: 18px;
@@ -341,10 +420,56 @@ watch([claudeMode, codexMode], ([c, x]) => {
   color: var(--dimmer);
 }
 .u-refresh::before,
-.u-refresh::after { content: none; }
-.u-refresh:hover {
+.u-refresh::after,
+.u-pick-btn::before,
+.u-pick-btn::after { content: none; }
+.u-refresh:hover,
+.u-pick-btn:hover {
   color: var(--amber);
   box-shadow: none;
+}
+.u-pick-btn {
+  margin-left: 0;
+  width: 20px;
+  font-size: 14px;
+}
+.u-pick-btn.on { color: var(--amber); }
+.u-refresh:focus-visible,
+.u-pick-btn:focus-visible {
+  outline: 1px solid var(--amber);
+  outline-offset: 1px;
+}
+
+/* 選擇要顯示的列：每個來源一行，勾選框排在後面 */
+.u-pick {
+  margin: 0 0 8px;
+  padding: 6px 8px;
+  border: 1px dashed var(--line-bright);
+}
+.pk-group {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  column-gap: 12px;
+  row-gap: 2px;
+}
+.pk-group + .pk-group { margin-top: 4px; }
+.pk-group .p-tag { min-width: 6ch; }
+.pk-opt {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  color: var(--dim);
+  cursor: pointer;
+}
+.pk-opt input { margin: 0; }
+.pk-opt:hover { color: var(--cream); }
+.pk-note {
+  margin: 6px 0 0;
+  font-size: 11px;
+  color: var(--dimmer);
 }
 .u-refresh .glyph { display: inline-block; }
 .u-refresh.spin { opacity: 1; color: var(--amber-dim); }
@@ -550,13 +675,16 @@ button.p-head.on .caret { color: var(--amber); }
     min-height: 40px;
     align-items: center;
   }
-  .u-refresh {
+  .u-refresh,
+  .u-pick-btn {
     width: 40px;
     height: 40px;
     margin-top: -11px;
     margin-bottom: -11px;
     font-size: 15px;
   }
+  .pk-opt { min-height: 40px; padding-right: 4px; }
+  .pk-opt input { width: 18px; height: 18px; }
   .usage .setup-link,
   .usage .setup-link:hover { min-height: 40px; align-items: center; }
   .p-err { align-items: center; }
