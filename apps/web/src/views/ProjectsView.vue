@@ -514,8 +514,9 @@ function stateOf(s) {
   padding-top: 8px;
   border-top: 1px dashed var(--line);
 }
-.p-actions {
-  justify-content: flex-end;
+/* 靠左，第一個按鈕抵銷自己的 padding：文字才會跟上面的 project 名稱、路徑切齊 */
+.p-actions > button.link:first-child {
+  margin-left: -8px;
 }
 .confirm-text {
   flex: 1;
@@ -569,6 +570,7 @@ button.small {
 }
 @media (pointer: coarse) {
   button.link { min-height: 40px; padding: 4px 12px; }
+  .p-actions > button.link:first-child { margin-left: -12px; }
 }
 @media (prefers-reduced-motion: reduce) {
   .proj.flash { animation: none; }
