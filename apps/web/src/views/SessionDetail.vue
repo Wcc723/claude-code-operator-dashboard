@@ -8,6 +8,7 @@ import TerminalPane from '../components/TerminalPane.vue';
 import KeyBar from '../components/KeyBar.vue';
 import Composer from '../components/Composer.vue';
 import ColorPicker from '../components/ColorPicker.vue';
+import TerminalLinkSheet from '../components/TerminalLinkSheet.vue';
 import { colorHex, colorMeta } from '../colors.js';
 
 const props = defineProps({ id: { type: String, required: true } });
@@ -195,9 +196,45 @@ function onColorFocusOut(e) {
   if (e.relatedTarget && !colorWrapRef.value?.contains(e.relatedTarget)) closeColor(false);
 }
 
+// ───── 連結清單（終端機捲動紀錄 + 畫面裡的網址；點不到連結時的保底）─────
+const linksOpen = ref(false);
+const linkItems = shallowRef([]);
+const linksAnchor = ref(null);
+const linksBtnRef = ref(null);
+
+// 窄螢幕（< 900px）頁首放不下「連結」按鈕，改放在 ⋯ 選單裡：用畫面上看得到的那一個當錨點 / 還焦點
+function linksOpener() {
+  const btn = linksBtnRef.value;
+  if (btn && btn.offsetParent !== null) return btn;
+  return menuBtnRef.value || null;
+}
+
+function toggleLinks() {
+  if (linksOpen.value) {
+    closeLinks('toggle');
+    return;
+  }
+  menuOpen.value = false;
+  promptOpen.value = false;
+  closeColor(false);
+  // 開的當下掃一次（不是即時更新的清單）
+  linkItems.value = pool.listLinks(props.id);
+  const r = linksOpener()?.getBoundingClientRect();
+  linksAnchor.value = r ? { left: r.left, right: r.right, top: r.top, bottom: r.bottom } : null;
+  linksOpen.value = true;
+}
+
+function closeLinks(reason) {
+  if (!linksOpen.value) return;
+  linksOpen.value = false;
+  // 桌面：焦點回到「連結」按鈕（或 ⋯）；點了別的地方就不搶。觸控不動焦點（免得跳鍵盤）
+  if (!coarse && reason !== 'outside' && reason !== 'switch') linksOpener()?.focus({ preventScroll: true });
+}
+
 // ───── ⋯ menu ─────
 const menuOpen = ref(false);
 const menuRef = ref(null);
+const menuBtnRef = ref(null);
 function onDocPointerDown(e) {
   if (menuOpen.value && menuRef.value && !menuRef.value.contains(e.target)) menuOpen.value = false;
   if (promptOpen.value && coarse && !e.target.closest?.('.ident')) promptOpen.value = false;
@@ -326,10 +363,16 @@ watch(() => props.id, () => {
   menuOpen.value = false;
   promptOpen.value = false;
   colorOpen.value = false;
+  closeLinks('switch');
   actionError.value = '';
 });
 
+// 這頁整頁都是終端機：關掉根元素的 overscroll（下拉重新整理），
+// 在頁首、KeyBar 附近往下拖也不會重新整理；離開這頁就還原成瀏覽器預設
+const NO_PULL_CLASS = 'codd-no-pull';
+
 onMounted(() => {
+  document.documentElement.classList.add(NO_PULL_CLASS);
   if (!store.loaded) store.refresh();
   clock = setInterval(() => { now.value = Date.now(); }, 1000);
   document.addEventListener('pointerdown', onDocPointerDown, true);
@@ -337,6 +380,7 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  document.documentElement.classList.remove(NO_PULL_CLASS);
   clearInterval(clock);
   clock = null;
   document.removeEventListener('pointerdown', onDocPointerDown, true);
@@ -431,6 +475,16 @@ onBeforeUnmount(() => {
             @click="store.toggleFocusMode()"
           >⤢</button>
           <button
+            ref="linksBtnRef"
+            type="button"
+            class="icon-btn links-btn"
+            :class="{ on: linksOpen }"
+            title="終端機裡的連結（開啟 / 複製）"
+            aria-haspopup="dialog"
+            :aria-expanded="linksOpen"
+            @click="toggleLinks"
+          >連結</button>
+          <button
             type="button"
             class="icon-btn glyph"
             :class="{ on: composerOn }"
@@ -440,6 +494,7 @@ onBeforeUnmount(() => {
           >⌨</button>
           <div ref="menuRef" class="menu-wrap">
             <button
+              ref="menuBtnRef"
               type="button"
               class="icon-btn"
               title="更多動作"
@@ -448,6 +503,8 @@ onBeforeUnmount(() => {
               @click="menuOpen = !menuOpen"
             >⋯</button>
             <div v-if="menuOpen" class="menu" role="menu">
+              <!-- 窄螢幕（< 900px）：頁首放不下「連結」按鈕，放這裡 -->
+              <button type="button" role="menuitem" class="links-item" aria-haspopup="dialog" @click="toggleLinks">⧉ 連結（開啟 / 複製）</button>
               <button type="button" role="menuitem" :disabled="!!busyAction" title="在 macOS 桌面另開一個 Terminal.app 跑同樣命令" @click="openDesktop">↗ OPEN IN TERMINAL.APP</button>
               <button type="button" role="menuitem" :disabled="!!busyAction" @click="restart">↻ RESTART</button>
               <button type="button" role="menuitem" class="m-danger" :disabled="!!busyAction || exited" @click="kill">■ KILL</button>
@@ -474,6 +531,17 @@ onBeforeUnmount(() => {
         <button type="button" class="primary" :disabled="!!busyAction" @click="restart">↻ RESTART</button>
         <button v-if="!session?.removed" type="button" class="danger" :disabled="!!busyAction" @click="remove">REMOVE</button>
       </div>
+
+      <TerminalLinkSheet
+        v-if="linksOpen"
+        mode="list"
+        :items="linkItems"
+        :variant="coarse ? 'sheet' : 'popover'"
+        :anchor="linksAnchor"
+        align="end"
+        :ignore="linksBtnRef"
+        @close="closeLinks"
+      />
 
       <div v-if="showKeyBar || showComposer" class="bottom">
         <KeyBar v-if="showKeyBar" @key="onKey" />
@@ -516,6 +584,11 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 10px;
   min-width: 0;
+  /* 平板寬度時標題（至少 8ch）+ chip 可能比 .ident 還寬：裁在這裡，不要畫到右邊的按鈕上。
+     .ident 本身不能 overflow: hidden（最近 prompt 的 popover 掛在它下面）；padding / 負 margin 留空間給燈號的光暈 */
+  overflow: hidden;
+  padding: 4px;
+  margin: -4px;
 }
 .title {
   margin: 0;
@@ -742,6 +815,18 @@ onBeforeUnmount(() => {
 }
 @media (pointer: coarse) {
   .icon-btn { min-width: 40px; min-height: 40px; }
+}
+.links-item { display: none; }
+/* 頁首放不下：手機會擠掉路徑、平板寬度（側欄開著）會擠掉狀態 chip。改放進 ⋯ 選單 */
+@media (max-width: 899px) {
+  .links-btn { display: none; }
+  .menu .links-item { display: block; }
+}
+.links-btn {
+  font-family: var(--cjk);
+  font-size: 13.5px;
+  letter-spacing: 0.04em;
+  padding: 0 8px;
 }
 .fs {
   min-width: 22px;

@@ -14,6 +14,7 @@ Fancy CODD：跑在一台常駐 Mac 上的單人管理介面。用 Google 登入
 | `apps/server`：artifact 後端 | `services/artifact-repo.js`（SQLite、canvas spec 與回覆 payload 的驗證與限長、草稿的已讀差異 `diffPayload`）、`artifact-frame.js`（frame 文件 + bridge script + sandbox CSP）、`artifact-notifier.js`（提交後等 session 閒置，在終端機打一行 `[CODD]` 通知）、`artifact-mcp.js`（`codd-artifacts` 的 5 個工具）、`mcp-tokens.js`（per-session / host bearer token、`--mcp-config` 與自動允許的 `--settings` 檔）；`routes/artifacts.js`（`/api/artifacts`，經過 `protect`）、`routes/mcp.js`（`/api/mcp`，stateless Streamable HTTP，只收 bearer token + 本機直連）；`terminal-manager.js` 的 `buildSpawnCommand` 負責往 `claude` 指令接 flag |
 | `apps/web` | Vite + Vue 3 SPA（`src/views/`、`src/components/`、`src/stores/`），production 時由 server 提供 `dist/` |
 | `apps/web`：artifact 前端 | `views/ArtifactsList.vue`（`/artifacts`）、`views/ArtifactView.vue`（`/artifact/:id`，standalone 版面）、`components/artifact/`（ArtifactFrame、CanvasBoard、留言、提交）、`lib/artifact-bridge.js`（跟 iframe 的 postMessage 協定）、`lib/canvas-viewport.js`（畫布平移縮放）、`stores/artifact-draft.js`（草稿與提交） |
+| `apps/web`：終端機 | `composables/terminalPool.js`（xterm 實例池、連結偵測、OSC 8 連結、`linkAtPoint`／`listLinks`）、`components/TerminalPane.vue`（點連結、觸控點擊）、`lib/terminal-touch.js`（觸控捲動與 `isTap`）、`lib/terminal-links.js`（純函式：找網址、接回軟／硬換行）、`lib/link-actions.js`（只開 http(s)、複製含後備）、`components/TerminalLinkSheet.vue`（開啟／複製的浮層與底部面板、連結清單） |
 | `apps/mcp` | stdio MCP server `codd-manager`，重用 server 的 services |
 | `scripts/` | `setup-cli.js`（user-level hooks + statusline）、`channel-cli.js`（channel 擴充） |
 | `configs/` | `hooks/status-writer.js`、`statusline/codd-statusline.js`、`agents/`、OAuth 與 Cloudflare 文件 |
@@ -48,6 +49,7 @@ node scripts/channel-cli.js status           # channel 擴充狀態（唯讀）
 - `schema.sql` 只有 `CREATE … IF NOT EXISTS`；舊資料庫要補欄位，寫在 `db/index.js` 的 `migrate()`，每一步都要能重跑。
 - 呼叫外部 CLI（cswap、codex）一律經過 `bin-resolve.js` 的 `resolveBin` / `childEnv`，因為 launchd 下 PATH 很短。
 - 寫 `~/.claude/settings.json` 只能透過 `claude-setup.js`（有備份、原子寫入、只動 `hooks` 與 `statusLine`）。
+- 終端機連結：只有 `http:`／`https:` 能開（`lib/terminal-links.js` 的 `webTarget`，去掉 `@` 前面的帳號資訊，`window.open` 帶 `noopener,noreferrer`），其他協定只能複製；網址顯示用文字插值，不用 `v-html`。OSC 8 連結的字跟網址主機不同時，⌘／Ctrl+點也要先給浮層，不直接開。
 - Artifact：HTML 只能經 frame 路由進 sandbox iframe（不加 `allow-same-origin`、`allow-top-navigation`，SPA 不拿原始 HTML、不用 `v-html`）；MCP token 不能出現在 log、API 回應、錯誤訊息或 `_toJson`；打進終端機的只有按提交時的固定模板通知，草稿不通知也不打字，使用者的回覆只能透過工具讀；`artifact_drafts.updated_at` 是併發檢查的版本標記，標已讀不能動它。
 
 ## 安全規則

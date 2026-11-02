@@ -46,6 +46,18 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+/* 終端機（terminalPool 建的 host，停車場裡也算）：不要繼承 body 的 letter-spacing。
+   xterm 量字寬時會吃到它，畫出來的字跟格子（點擊、選取、連結判斷用的）一欄差 0.16px，越右邊差越多 */
+.codd-term-host {
+  letter-spacing: 0;
+}
+
+/* session 頁（SessionDetail 掛上 class）：不要下拉重新整理、不要整頁回彈 */
+html.codd-no-pull,
+html.codd-no-pull body {
+  overscroll-behavior-y: none;
+}
+
 /* CRT scanlines overlay */
 body::before {
   content: '';

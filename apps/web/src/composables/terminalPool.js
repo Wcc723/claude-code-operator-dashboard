@@ -3,6 +3,8 @@ import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 import { api } from '../api.js';
+import { pickScrollMode } from '../lib/terminal-touch.js';
+import { textLinksAtRow, scanTextLinks, overlapsRanges, mergeLinkList, rangeContains, webTarget, displayUrl } from '../lib/terminal-links.js';
 
 // 終端機池：module 層 LRU，最多 3 個「活的」xterm + EventSource。
 // 切換 session 時只把 host div 搬到可見容器（不重開、不重播），
@@ -17,6 +19,8 @@ const MAX_COLS = 500;
 const MAX_ROWS = 200;
 // 舊版 server（reset 沒帶 caughtup:true、不送 caughtup）的退路：reset 後這麼久內到的第一包當成重播
 const CATCHUP_WINDOW_MS = 250;
+// OSC 8 連結跨好幾行（Ink 硬換行）時，往上 / 往下最多找幾行同一個網址（⌘ / Ctrl+點時比對畫面上的字）
+const MAX_OSC_JOIN_ROWS = 16;
 // EventSource 放棄重連（非 200：Cloudflare 502/530、401…）後自己重試的退避
 const RETRY_BASE_MS = 1000;
 const RETRY_MAX_MS = 30000;
@@ -102,6 +106,8 @@ function create(id, clientId) {
   host.className = 'codd-term-host';
   parkingLot().appendChild(host);
 
+  // e 在下面才建立；這些 callback 只會在之後（滑鼠 / 解析輸出時）被呼叫
+  let e = null;
   const term = new Terminal({
     cursorBlink: false,
     convertEol: false,
@@ -109,16 +115,33 @@ function create(id, clientId) {
     fontSize: termPrefs.fontSize,
     theme: THEME,
     scrollback: 5000,
+    // Claude Code 開著滑鼠追蹤時，Mac 上一般拖曳會變成滑鼠事件送給它；按住 Option 拖曳改成選取文字（再 ⌘C 複製）。
+    // 其他平台是 Shift 拖曳（xterm 預設）
+    macOptionClickForcesSelection: true,
+    // Option+點一下預設會用方向鍵把游標移過去：app 開著滑鼠追蹤（Claude Code）時會送進幾千個方向鍵。
+    // 預設關掉；沒開滑鼠追蹤（一般 shell）時在 mousedown 當下打開（wireDom），維持原本的行為
+    altClickMovesCursor: false,
+    // OSC 8 超連結：不用 xterm 預設的 window.confirm（英文、會卡住頁面），交給 TerminalPane 的連結面板。
+    // 非 http(s) 的也收（file:// 之類），面板只給「複製」；真正開網頁的只有 lib/link-actions.js 的 openWebUrl
+    linkHandler: {
+      activate: (ev, text, range) => xtermActivated(e, { url: text, osc: true, range }, ev),
+      // 滑鼠停在連結上：提示真正會去哪裡（OSC 8 畫面上的字可以跟網址不一樣）
+      hover: (ev, text) => showLinkHint(e, text),
+      leave: () => clearLinkHint(e),
+      allowNonHttpProtocols: true,
+    },
   });
   const fit = new FitAddon();
   term.loadAddon(fit);
 
-  const e = {
+  e = {
     id,
     clientId,
     term,
     fit,
     host,
+    linkProvider: null,
+    oscSeen: 0,           // 看過幾個 OSC 8（0 = 這個 session 沒有，連結清單 / 重疊檢查不用問 OSC 8）
     es: null,
     container: null,
     opened: false,
@@ -132,6 +155,7 @@ function create(id, clientId) {
       follow: false,        // true = 依 PTY 尺寸顯示（容器捲動），false = 貼合容器
       exited: false,
       exitInfo: null,
+      scrolledUp: false,    // 終端機往上捲、沒在看最新輸出（顯示「↓ 最新」）
     }),
     // 輸入：同一個 session 只有一條有序的送出佇列
     pending: '',
@@ -154,6 +178,38 @@ function create(id, clientId) {
     foreign: false,     // 另一個分頁拿著同一個 client id 在控制：跟隨它，等這裡有人操作才搶回
   };
 
+  // 純文字網址（xterm 只認 OSC 8）：hover 畫底線、點擊交給 TerminalPane。
+  // xterm 依註冊順序排優先：OSC 8 的 provider 在 xterm 建構時就註冊，排在這個前面，同一格以 OSC 8 為準。
+  // 蓋到 OSC 8 格子的純文字網址整個不算（OSC 8 自己帶真正的網址）：OSC 8 連結後面接著網址字元、
+  // 或 OSC 8 連結剛好寫到行尾被硬換行規則接到下一行的字，都不會多出一個錯的連結
+  e.linkProvider = {
+    provideLinks(y, callback) {
+      let links = [];
+      try {
+        const b = term.buffer.active;
+        links = textLinksAtRow((r) => b.getLine(r), y - 1, b.length, term.cols, b.getNullCell());
+        if (links.length && e.oscSeen) {
+          const oscRows = new Map();
+          links = links.filter((l) => !coveredByOsc(e, l.segments, oscRows));
+        }
+      } catch { links = []; }
+      callback(links.length ? links.map((l) => ({
+        text: l.url,
+        range: l.range,
+        activate: (ev, text) => xtermActivated(e, { url: text, osc: false, range: l.range }, ev),
+        hover: (ev, text) => showLinkHint(e, text),
+        leave: () => clearLinkHint(e),
+      })) : undefined);
+    },
+  };
+  term.registerLinkProvider(e.linkProvider);
+  // 不攔 OSC 8（回傳 false，xterm 照常處理），只數有沒有出現過（不留網址本身）
+  term.parser.registerOscHandler(8, (data) => {
+    const i = data.indexOf(';');
+    if (i >= 0 && i < data.length - 1) e.oscSeen += 1;
+    return false;
+  });
+
   // Alt+1..9 留給 app 的切換 session 快捷鍵；其他按鍵視為「這台在操作」
   term.attachCustomKeyEventHandler((ev) => {
     if (ev.type === 'keydown' && ev.altKey && /^Digit[1-9]$/.test(ev.code)) return false;
@@ -168,6 +224,17 @@ function create(id, clientId) {
     e.pending += s;
     if (!e.inputTimer) e.inputTimer = setTimeout(() => flushPending(e), INPUT_DEBOUNCE_MS);
   });
+
+  // 「↓ 最新」按鈕：使用者捲動、新輸出、切換 alt buffer、改尺寸都可能改變是否在最底下
+  const updateScrolled = () => {
+    const b = e.term.buffer.active;
+    const up = b.viewportY < b.baseY;
+    if (e.state.scrolledUp !== up) e.state.scrolledUp = up;
+  };
+  term.onScroll(updateScrolled);
+  term.onWriteParsed(updateScrolled);
+  term.onResize(updateScrolled);
+  term.buffer.onBufferChange(updateScrolled);
 
   connect(e);
   return e;
@@ -433,6 +500,11 @@ async function pump(e) {
 
 function wireDom(e) {
   e.host.addEventListener('paste', () => interact(e), true);
+  // 在 xterm 之前（capture）：沒開滑鼠追蹤時 Option+點一下照舊移動游標，開著時不移（見 Terminal 的 altClickMovesCursor）
+  e.host.addEventListener('mousedown', () => {
+    const want = e.term.modes.mouseTrackingMode === 'none';
+    if (e.term.options.altClickMovesCursor !== want) e.term.options.altClickMovesCursor = want;
+  }, true);
   e.term.textarea?.addEventListener('focus', () => {
     if (!e.quietFocus) interact(e);
   });
@@ -511,9 +583,11 @@ function focusQuietly(e) {
   try { e.term.focus(); } finally { e.quietFocus = false; }
 }
 
-export function focus(id) {
+export function focus(id, { quiet = false } = {}) {
   const e = pool.get(id);
-  if (e?.opened) e.term.focus();
+  if (!e?.opened) return;
+  if (quiet) focusQuietly(e);
+  else e.term.focus();
 }
 
 export function claim(id) {
@@ -592,6 +666,336 @@ export function cursorBottomPx(id) {
   if (!e?.opened || !screen || !e.term.rows) return null;
   const cellH = screen.offsetHeight / e.term.rows;
   return (e.term.buffer.active.cursorY + 1) * cellH;
+}
+
+// ───── 觸控捲動（lib/terminal-touch.js）─────
+// 每次手勢開始時拿一份；方法每次都重新查 entry，切走或被踢掉後就變成 no-op。
+// 這裡刻意不呼叫 interact()：捲動只是在看，不算「這台在操作」，不搶 PTY 尺寸。
+
+function liveEntry(id) {
+  const e = pool.get(id);
+  return e && e.opened && !e.disposed && e.container ? e : null;
+}
+
+function cellHeightOf(e) {
+  const screen = e.host.querySelector('.xterm-screen');
+  const h = screen && e.term.rows ? screen.offsetHeight / e.term.rows : 0;
+  return h > 0 ? h : Math.round(e.term.options.fontSize * 1.2);
+}
+
+export function touchTarget(id) {
+  return {
+    mode() {
+      const e = liveEntry(id);
+      if (!e) return 'none';
+      return pickScrollMode({
+        alt: e.term.buffer.active.type === 'alternate',
+        mouseTracking: e.term.modes.mouseTrackingMode,
+      });
+    },
+    cellHeight() {
+      const e = liveEntry(id);
+      return e ? cellHeightOf(e) : 0;
+    },
+    // 回傳實際捲了幾行（到頂 / 到底時會比要求的少）
+    scrollLines(n) {
+      const e = liveEntry(id);
+      if (!e || !n) return 0;
+      const b = e.term.buffer.active;
+      const to = Math.min(b.baseY, Math.max(0, b.viewportY + n));
+      const moved = to - b.viewportY;
+      if (moved) e.term.scrollLines(moved);
+      return moved;
+    },
+    canScroll(dir) {
+      const e = liveEntry(id);
+      if (!e) return false;
+      const b = e.term.buffer.active;
+      return dir < 0 ? b.viewportY > 0 : dir > 0 ? b.viewportY < b.baseY : false;
+    },
+    // app 開了滑鼠追蹤：每一行送一個滾輪事件給 xterm，由它編成 wheel report 送進 PTY（走 onData 那條佇列）
+    wheel(lines, x, y) {
+      const e = liveEntry(id);
+      const el = e?.term.element;
+      const screen = el?.querySelector('.xterm-screen');
+      if (!screen || !lines) return;
+      const r = screen.getBoundingClientRect();
+      const cx = Math.min(Math.max(x, r.left + 1), r.right - 1);
+      const cy = Math.min(Math.max(y, r.top + 1), r.bottom - 1);
+      const sign = Math.sign(lines);
+      for (let i = 0; i < Math.abs(lines); i++) {
+        el.dispatchEvent(new WheelEvent('wheel', {
+          deltaY: sign,
+          deltaMode: WheelEvent.DOM_DELTA_LINE,
+          clientX: cx,
+          clientY: cy,
+          bubbles: true,
+          cancelable: true,
+        }));
+      }
+    },
+  };
+}
+
+// ───── 連結（lib/terminal-links.js 找、TerminalPane 的連結面板開 / 複製）─────
+
+const linkListeners = new Set();
+
+/** 訂閱「xterm 自己觸發的連結點擊」（OSC 8 / 純文字網址）；回傳取消訂閱 */
+export function onLinkActivate(fn) {
+  linkListeners.add(fn);
+  return () => linkListeners.delete(fn);
+}
+
+// xterm 的 Linkifier 在 mouseup 時觸發。一般點擊 TerminalPane 已經處理了（mousedown 攔下，或沒開滑鼠追蹤時在 mouseup 開），
+// 這裡是退路；Shift / Alt 是在選取文字，右鍵 / 中鍵照舊交給 app，都不當成點連結
+function xtermActivated(e, info, ev) {
+  if (!e || e.disposed || ev?.shiftKey || ev?.altKey) return;
+  if (ev && typeof ev.button === 'number' && ev.button !== 0) return;
+  for (const fn of linkListeners) {
+    try { fn({ id: e.id, ...info, event: ev ?? null }); } catch (err) { console.warn('[links]', err?.message || err); }
+  }
+}
+
+// xterm 內部的 link provider 清單（第一個是 OSC 8）。是私有 API：拿不到就退回只看純文字網址
+function linkProvidersOf(e) {
+  try {
+    const list = e.term._core?._linkProviderService?.linkProviders;
+    if (Array.isArray(list) && list.includes(e.linkProvider)) return list;
+  } catch {}
+  return null;
+}
+
+// OSC 8 的 provider（xterm 內建、不是自己註冊的那個）
+function oscProvidersOf(e) {
+  const list = linkProvidersOf(e);
+  return list ? list.filter((p) => p !== e.linkProvider) : [];
+}
+
+// 第 y 行（0-based）的 OSC 8 連結（provideLinks 是同步回呼）
+function oscLinksAt(e, y, providers = oscProvidersOf(e)) {
+  const out = [];
+  for (const p of providers) {
+    let got = null;
+    try { p.provideLinks(y + 1, (links) => { got = links; }); } catch { got = null; }
+    if (got?.length) for (const l of got) if (typeof l?.text === 'string' && l.range) out.push(l);
+  }
+  return out;
+}
+
+// 純文字網址的格子有沒有蓋到 OSC 8 連結；cache = 這一輪已經問過的行
+function coveredByOsc(e, segments, cache) {
+  const providers = oscProvidersOf(e);
+  if (!providers.length) return false;
+  for (const s of segments) {
+    if (!cache.has(s.y)) cache.set(s.y, oscLinksAt(e, s.y, providers).map((l) => l.range));
+    const ranges = cache.get(s.y);
+    if (ranges.length && overlapsRanges([s], ranges, e.term.cols)) return true;
+  }
+  return false;
+}
+
+// 滑鼠停在連結上的提示（瀏覽器原生 tooltip）：主機 + 網址（看不見的字元換掉、太長截斷），只用文字
+const HINT_URL_CHARS = 200;
+function showLinkHint(e, url) {
+  const screen = e && !e.disposed ? screenOf(e) : null;
+  if (!screen || typeof url !== 'string') return;
+  const t = webTarget(url);
+  const shown = displayUrl(url, HINT_URL_CHARS).text;
+  screen.title = t ? `前往 ${t.host}\n${shown}\n（點一下：開啟 / 複製）` : `${shown}\n（不是網頁連結，點一下可以複製）`;
+}
+function clearLinkHint(e) {
+  const screen = e && !e.disposed ? screenOf(e) : null;
+  if (screen?.hasAttribute('title')) screen.removeAttribute('title');
+}
+
+function screenOf(e) {
+  return e.term.element?.querySelector('.xterm-screen') || null;
+}
+
+// 畫面座標 → buffer 的格子（0-based）
+function cellAt(e, clientX, clientY) {
+  const screen = screenOf(e);
+  if (!screen || !e.term.cols || !e.term.rows) return null;
+  const r = screen.getBoundingClientRect();
+  if (!(clientX >= r.left && clientX < r.right && clientY >= r.top && clientY < r.bottom)) return null;
+  const x = Math.min(e.term.cols - 1, Math.floor((clientX - r.left) / (r.width / e.term.cols)));
+  const row = Math.min(e.term.rows - 1, Math.floor((clientY - r.top) / (r.height / e.term.rows)));
+  return { x, y: e.term.buffer.active.viewportY + row };
+}
+
+/** 事件的 target 是不是終端機的文字區（不是捲軸、不是疊在上面的按鈕） */
+export function isTerminalScreen(id, target) {
+  const e = liveEntry(id);
+  const screen = e && screenOf(e);
+  return !!screen && !!target && screen.contains(target);
+}
+
+/**
+ * 畫面上這一點的連結：先問 OSC 8、再問純文字網址（跟 xterm hover 的優先順序一樣）。
+ * @returns {null | { url: string, osc: boolean, range: object }}
+ */
+export function linkAtPoint(id, clientX, clientY) {
+  const e = liveEntry(id);
+  if (!e) return null;
+  const pos = cellAt(e, clientX, clientY);
+  if (!pos) return null;
+  const providers = linkProvidersOf(e) || [e.linkProvider];
+  for (const p of providers) {
+    let got = null;
+    try { p.provideLinks(pos.y + 1, (links) => { got = links; }); } catch { got = null; }
+    const hit = got?.find((l) => l?.range && rangeContains(l.range, pos.x, pos.y, e.term.cols));
+    if (hit && typeof hit.text === 'string') return { url: hit.text, osc: p !== e.linkProvider, range: hit.range };
+  }
+  return null;
+}
+
+/** 連結第一行在畫面上的位置（桌面浮層定位用）；不在畫面上回傳 null */
+export function linkRect(id, range) {
+  const e = liveEntry(id);
+  const screen = e && screenOf(e);
+  if (!screen || !range) return null;
+  const r = screen.getBoundingClientRect();
+  const cw = r.width / e.term.cols;
+  const ch = r.height / e.term.rows;
+  const row = range.start.y - 1 - e.term.buffer.active.viewportY;
+  if (row < 0 || row >= e.term.rows) return null;
+  const top = r.top + row * ch;
+  const left = r.left + (range.start.x - 1) * cw;
+  const right = range.end.y === range.start.y ? r.left + range.end.x * cw : r.right;
+  return { left, right, top, bottom: top + ch };
+}
+
+/**
+ * 這個 session 的 buffer（捲動紀錄 + 畫面）裡的連結：越新越前面、不重複、最多 50 筆。
+ * 開清單時才算（5000 行捲動紀錄約數毫秒）。
+ * @returns {{ url: string, osc: boolean }[]}
+ */
+export function listLinks(id) {
+  const e = pool.get(id);
+  if (!e || e.disposed) return [];
+  const buf = e.term.buffer.active;
+  const cols = e.term.cols;
+  const total = buf.length;
+  const items = [];
+  const oscByRow = new Map(); // y → OSC 8 的 range（純文字網址蓋到的不算）
+  const providers = linkProvidersOf(e);
+  if (providers && e.oscSeen) {
+    for (const p of providers) {
+      if (p === e.linkProvider) continue;
+      for (let y = 0; y < total; y++) {
+        let got = null;
+        try { p.provideLinks(y + 1, (links) => { got = links; }); } catch { got = null; }
+        if (!got?.length) continue;
+        for (const l of got) {
+          if (typeof l?.text !== 'string' || !l.range) continue;
+          items.push({ url: l.text, y: l.range.start.y - 1, x: l.range.start.x - 1, osc: true });
+          for (let r = l.range.start.y - 1; r <= l.range.end.y - 1; r++) {
+            if (!oscByRow.has(r)) oscByRow.set(r, []);
+            oscByRow.get(r).push(l.range);
+          }
+        }
+      }
+    }
+  }
+  for (const t of scanTextLinks((y) => buf.getLine(y), total, cols, buf.getNullCell())) {
+    const ranges = t.segments.flatMap((s) => oscByRow.get(s.y) || []);
+    if (ranges.length && overlapsRanges(t.segments, ranges, cols)) continue;
+    items.push({ url: t.url, y: t.y, x: t.x, osc: false });
+  }
+  return mergeLinkList(items);
+}
+
+// 連結那幾行目前的字（判斷連結有沒有被捲走 / 改寫）
+function rowsText(buf, range) {
+  const y0 = range.start.y - 1;
+  const y1 = Math.min(range.end.y - 1, y0 + MAX_OSC_JOIN_ROWS);
+  let out = '';
+  for (let y = y0; y <= y1; y++) out += (buf.getLine(y)?.translateToString(false) ?? '') + '\n';
+  return out;
+}
+
+/**
+ * 連結在畫面上移動了（使用者捲動、新輸出把它推走、Claude Code 的捲動區域把那幾行改寫、換 buffer、改尺寸）時通知。
+ * 只是有新輸出、但使用者往上捲著看、連結沒動：不通知（浮層不會一有輸出就關掉）。
+ * @returns {() => void} 取消訂閱
+ */
+export function onLinkMoved(id, range, fn) {
+  const e = pool.get(id);
+  if (!e || e.disposed || !range) return () => {};
+  const snap = () => {
+    const b = e.term.buffer.active;
+    return `${b.type}|${b.viewportY}|${rowsText(b, range)}`;
+  };
+  const start = snap();
+  let raf = 0;
+  let done = false;
+  const fire = () => {
+    if (done) return;
+    done = true;
+    fn();
+  };
+  const check = () => {
+    raf = 0;
+    if (!done && snap() !== start) fire();
+  };
+  // 輸出很密時（Claude Code 的 spinner）一個 frame 只比一次
+  const schedule = () => { if (!raf && !done) raf = requestAnimationFrame(check); };
+  const subs = [
+    e.term.onScroll(schedule),
+    e.term.onWriteParsed(schedule),
+    e.term.onResize(fire),
+    e.term.buffer.onBufferChange(fire),
+  ];
+  return () => {
+    done = true;
+    if (raf) cancelAnimationFrame(raf);
+    for (const d of subs) { try { d.dispose(); } catch {} }
+  };
+}
+
+/** 有沒有選取文字（拖曳 / 雙擊選字之後不要再開連結面板） */
+export function hasSelection(id) {
+  const e = liveEntry(id);
+  try { return !!e && e.term.hasSelection(); } catch { return false; }
+}
+
+/** app 開的滑鼠追蹤模式（'none' = 沒開：一般 shell，點擊、拖曳由 xterm 自己處理） */
+export function mouseTracking(id) {
+  const e = liveEntry(id);
+  return e ? e.term.modes.mouseTrackingMode : 'none';
+}
+
+/**
+ * 連結在畫面上的字（⌘ / Ctrl+點時比對「看到的」跟「真正要去的」）。
+ * OSC 8：被 Ink 硬換行切開的同一個連結，把上下相鄰幾行的那一段也接起來。純文字網址：就是網址本身。
+ */
+export function linkVisibleText(id, hit) {
+  const e = liveEntry(id);
+  if (!e || !hit?.range) return '';
+  if (!hit.osc) return hit.url;
+  const buf = e.term.buffer.active;
+  const piece = (r) => buf.getLine(r.start.y - 1)?.translateToString(false, r.start.x - 1, r.end.x) ?? '';
+  const providers = oscProvidersOf(e);
+  const y = hit.range.start.y - 1;
+  let text = piece(hit.range);
+  for (let r = y - 1, n = 0; r >= 0 && n < MAX_OSC_JOIN_ROWS; r--, n++) {
+    const same = oscLinksAt(e, r, providers).filter((l) => l.text === hit.url);
+    if (!same.length) break;
+    text = piece(same[same.length - 1].range).trimEnd() + text.trimStart();
+  }
+  for (let r = hit.range.end.y, n = 0; r < buf.length && n < MAX_OSC_JOIN_ROWS; r++, n++) {
+    const same = oscLinksAt(e, r, providers).filter((l) => l.text === hit.url);
+    if (!same.length) break;
+    text = text.trimEnd() + piece(same[0].range).trimStart();
+  }
+  return text.trim();
+}
+
+// 「↓ 最新」：回到最新輸出
+export function scrollToBottom(id) {
+  const e = pool.get(id);
+  if (e?.opened && !e.disposed) e.term.scrollToBottom();
 }
 
 export function stateOf(id) {
