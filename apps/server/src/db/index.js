@@ -48,16 +48,30 @@ export function openDb(dbPath) {
 // 每一步都要能重跑（先看欄位在不在）。
 function migrate(db) {
   addColumnIfMissing(db, 'launch_profiles', 'color', 'TEXT');
+  // 已讀狀態是新功能：之前留在舊版本的草稿（切版本時內容已經帶走，甚至已經提交）不該一次全部變成「未讀」。
+  // 只在真的補上 read_payload 的那一次把它們標成讀過；欄位已經在就不動，重跑不會蓋掉之後的狀態
+  db.transaction(() => {
+    if (addColumnIfMissing(db, 'artifact_drafts', 'read_payload', 'TEXT')) {
+      addColumnIfMissing(db, 'artifact_drafts', 'read_at', 'TEXT');
+      db.prepare(`UPDATE artifact_drafts SET read_payload = payload, read_at = ?
+        WHERE version < (SELECT current_version FROM artifacts WHERE artifacts.id = artifact_drafts.artifact_id)`)
+        .run(new Date().toISOString());
+    }
+    addColumnIfMissing(db, 'artifact_drafts', 'read_at', 'TEXT');
+  })();
 }
 
+// → true = 這一次真的加了欄位
 function addColumnIfMissing(db, table, column, type) {
   const cols = db.prepare(`PRAGMA table_info(${table})`).all();
-  if (cols.some((c) => c.name === column)) return;
+  if (cols.some((c) => c.name === column)) return false;
   try {
     db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+    return true;
   } catch (e) {
     // server 與 MCP（apps/mcp 也呼叫 openDb）同時開同一個舊 DB 時，另一邊可能剛好先加了
     if (!/duplicate column name/i.test(String(e.message))) throw e;
+    return false;
   }
 }
 

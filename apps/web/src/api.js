@@ -134,15 +134,21 @@ export const api = {
   },
   getArtifact: (id, { version } = {}) =>
     request(`/artifacts/${encodeURIComponent(id)}${version ? `?v=${encodeURIComponent(version)}` : ''}`),
+  // 某一版的草稿與已讀狀態（unread_payload = Claude 還沒讀過的內容；切到新版本前重新問，頁面載入時的狀態已經過期）
+  getArtifactDraft: (id, version) =>
+    request(`/artifacts/${encodeURIComponent(id)}/draft${version ? `?v=${encodeURIComponent(version)}` : ''}`),
   // 草稿 PUT 的 body（ArtifactView 要先量大小決定能不能用 keepalive，所以獨立出來）。
   // base：上次 GET / PUT 拿到的 draft_updated_at（沒有草稿時是 null）；server 存的不一樣 → 409 draft_conflict。undefined = 不檢查
   artifactDraftBody: (version, payload, base) =>
     JSON.stringify(base === undefined ? { version, payload } : { version, payload, base_updated_at: base }),
   // keepalive：關分頁 / 切到背景時用，讓請求在頁面卸載後仍送得出去（瀏覽器限制 body ≤ 64 KiB，呼叫端自己量）
-  saveArtifactDraft: (id, version, payload, { keepalive = false, base, body } = {}) =>
+  // baseReadAt：算這份內容時看到的 draft_read_at；Claude 之後又讀過 → 409 draft_conflict（標已讀不會改 base 比對的時間）
+  saveArtifactDraft: (id, version, payload, { keepalive = false, base, baseReadAt, body } = {}) =>
     request(`/artifacts/${encodeURIComponent(id)}/draft`, {
       method: 'PUT',
-      body: body ?? api.artifactDraftBody(version, payload, base),
+      body: body ?? (baseReadAt === undefined
+        ? api.artifactDraftBody(version, payload, base)
+        : JSON.stringify({ version, payload, base_updated_at: base, base_read_at: baseReadAt })),
       ...(keepalive ? { keepalive: true } : {}),
     }),
   submitArtifact: (id, { version, payload, notify = true, base }) => request(`/artifacts/${encodeURIComponent(id)}/submissions`, {

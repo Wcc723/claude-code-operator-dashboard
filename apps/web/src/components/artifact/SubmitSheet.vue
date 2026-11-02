@@ -5,7 +5,7 @@
 // 焦點：打開時放在輸入框（看結果時放在結果訊息），Tab 在 sheet 內循環；Esc 由 ArtifactView 統一處理。
 // readonly（舊版本）：只能看，「給 Claude 的話」用 readonly（不是 disabled），文字可以選取、複製。
 import { computed, nextTick, onMounted, ref, watch } from 'vue';
-import { LIMITS, notifyResultText, payloadCounts } from '../../stores/artifact-draft.js';
+import { LIMITS, noSubmitHint, notifyResultText, payloadCounts } from '../../stores/artifact-draft.js';
 
 const props = defineProps({
   payload: { type: Object, required: true },
@@ -207,6 +207,7 @@ onMounted(focusInitial);
           <button v-if="error.status === 409" type="button" class="ss-btn go" @click="emit('goto-latest')">切到最新版本</button>
         </p>
         <p v-else-if="counts.empty && !blocked" class="ss-help">還沒有任何內容：留言、作答、選一個 frame，或寫幾句給 Claude 的話。</p>
+        <p v-if="!readonly" class="ss-help">{{ noSubmitHint(origin) }}</p>
 
         <footer class="ss-actions">
           <template v-if="readonly">

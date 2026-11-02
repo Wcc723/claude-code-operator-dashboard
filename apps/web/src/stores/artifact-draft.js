@@ -14,6 +14,16 @@ export const LIMITS = {
   stickies: 100,
 };
 
+// 不按提交也讀得到（回覆自動存好，使用者開口 Claude 才讀）：SubmitSheet 與留言清單共用這句
+export const NO_SUBMIT_HINT = '不提交也可以：回覆會自動存好，回 session 跟 Claude 說一聲就讀得到。';
+
+/** 同一句話，但 session 已經結束（或本來就沒有）的時候沒有「回 session」可言，要先交給一個活著的 session */
+export function noSubmitHint(origin) {
+  if (origin?.alive) return NO_SUBMIT_HINT;
+  const why = origin ? '原本的 session 已經結束' : '這個 artifact 沒有對應的 session';
+  return `不提交也可以：回覆會自動存好。${why}，按上面的「接手…」交給一個 session，再跟它說一聲就讀得到。`;
+}
+
 export function emptyPayload() {
   return { message: '', comments: [], answers: {}, selected: [], stickies: [], data: null };
 }
@@ -37,6 +47,8 @@ export function normalizeDraft(raw) {
     selected: Array.isArray(p.selected) ? p.selected.filter((x) => typeof x === 'string') : [],
     stickies: Array.isArray(p.stickies) ? p.stickies.filter(isObj).map((s) => ({ ...s, text: typeof s.text === 'string' ? s.text : '' })) : [],
     data: p.data === undefined ? null : p.data,
+    // 頁面自己呼叫 window.codd.submit（當下沒有使用者操作）：Claude 讀的時候會看到這個標記
+    ...(p.data_origin === 'page' && p.data != null ? { data_origin: 'page' } : {}),
   };
 }
 
@@ -239,15 +251,17 @@ export function isEmptyDraft(payload) {
 }
 
 /**
- * Claude 發布新版本時，把舊版本（還沒提交的）回覆帶到新版本的草稿。
+ * Claude 發布新版本時，把舊版本的回覆帶到新版本的草稿。
+ * from 只放要帶的內容：切版本時傳 server 算好的 unread_payload（Claude 還沒讀過的），讀過的留在舊版本當紀錄。
  * - 給 Claude 的話：照帶。
  * - 留言：frame 在新版本還在的才帶（html kind 一律是 main）；空白的不帶。位置 / 點到的元素照舊（新版本的版面可能變了，
  *   但文字是重點）。
  * - 作答：題目 id 在新版本還在的才帶；選這個：frame 還在的才帶；便利貼（canvas）：有寫字的都帶。
  * - 頁面資料（window.codd.submit）：屬於舊版本的頁面，不帶。
+ * fromVersion：帶過來的留言 / 便利貼記下來自哪一版（元素與座標是那一版的，Claude 讀的時候要知道）；已經記過的不改。
  * 回傳 { payload, dropped: { comments, answers, selected, stickies, data } }（dropped 是沒帶過去的數量）。
  */
-export function carryDraft(from, view, { kind } = {}) {
+export function carryDraft(from, view, { kind, fromVersion } = {}) {
   const p = normalizeDraft(from);
   const isCanvas = (kind ?? view?.kind) === 'canvas';
   const frameIds = new Set(isCanvas
@@ -259,8 +273,9 @@ export function carryDraft(from, view, { kind } = {}) {
   const out = emptyPayload();
   out.message = p.message;
 
+  const tag = (x) => (fromVersion && !x.carried_from ? { ...x, carried_from: fromVersion } : { ...x });
   const comments = p.comments.filter((c) => !isBlank(c.text));
-  out.comments = comments.filter((c) => frameIds.has(c.frame_id)).slice(0, LIMITS.comments).map((c) => ({ ...c }));
+  out.comments = comments.filter((c) => frameIds.has(c.frame_id)).slice(0, LIMITS.comments).map(tag);
 
   const answerKeys = Object.keys(p.answers).filter((k) => answered(p.answers[k]));
   for (const k of answerKeys) {
@@ -271,7 +286,7 @@ export function carryDraft(from, view, { kind } = {}) {
 
   if (isCanvas) {
     out.selected = p.selected.filter((id) => frameIds.has(id));
-    out.stickies = p.stickies.filter((s) => !isBlank(s.text)).slice(0, LIMITS.stickies).map((s) => ({ ...s }));
+    out.stickies = p.stickies.filter((s) => !isBlank(s.text)).slice(0, LIMITS.stickies).map(tag);
   }
 
   return {
@@ -283,6 +298,89 @@ export function carryDraft(from, view, { kind } = {}) {
       stickies: isCanvas ? p.stickies.filter((s) => !isBlank(s.text)).length - out.stickies.length : 0,
       data: p.data != null,
     },
+  };
+}
+
+/**
+ * 帶到新版本之後，舊版本的草稿要拿掉帶走的項目，不然 Claude 會在兩個版本各讀到一次：
+ * 新增的直接拿掉，上次讀過、後來又改過的還原成讀到的內容。沒帶走的（對不上新版本、頁面資料）留著。
+ * from：舊版本目前的草稿；read：Claude 上次讀到的內容；carried：新版本實際存進去的內容（server 正規化後）。
+ */
+export function stripCarried(from, read, carried) {
+  const p = normalizeDraft(from);
+  const r = normalizeDraft(read);
+  const c = normalizeDraft(carried);
+  const strip = (list, readList, carriedList) => {
+    const moved = new Set(carriedList.map((x) => x.id));
+    const readById = new Map(readList.map((x) => [x.id, x]));
+    return list.flatMap((x) => {
+      if (!moved.has(x.id)) return [x];
+      return readById.has(x.id) ? [readById.get(x.id)] : [];
+    });
+  };
+  const answers = {};
+  for (const [k, v] of Object.entries(p.answers)) {
+    if (!Object.hasOwn(c.answers, k)) answers[k] = v;
+    else if (Object.hasOwn(r.answers, k)) answers[k] = r.answers[k];
+  }
+  return {
+    message: isBlank(c.message) ? p.message : r.message,
+    comments: strip(p.comments, r.comments, c.comments),
+    answers,
+    selected: p.selected.filter((id) => !c.selected.includes(id) || r.selected.includes(id)),
+    stickies: strip(p.stickies, r.stickies, c.stickies),
+    data: p.data,
+  };
+}
+
+/**
+ * 切版本時還沒存進 server 的修改（自動儲存失敗或太慢）：把「最後存好的內容 → 畫面上的內容」的差異套到 base 上。
+ * server 算的 unread_payload 看不到這些修改，不套的話使用者最後打的字會憑空消失。
+ * base 傳空的 payload 就只拿到沒存進去的部分。
+ */
+export function overlayUnsaved(base, saved, local) {
+  const out = normalizeDraft(base);
+  const s = normalizeDraft(saved);
+  const l = normalizeDraft(local);
+  const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const list = (cur, savedList, localList) => {
+    const before = new Map(savedList.map((x) => [x.id, x]));
+    const after = new Set(localList.map((x) => x.id));
+    const res = cur.filter((x) => !before.has(x.id) || after.has(x.id)); // 畫面上刪掉的
+    for (const x of localList) {
+      if (same(before.get(x.id), x)) continue;
+      const i = res.findIndex((y) => y.id === x.id);
+      if (i >= 0) res[i] = x;
+      else res.push(x);
+    }
+    return res;
+  };
+  if (l.message !== s.message) out.message = l.message;
+  out.comments = list(out.comments, s.comments, l.comments);
+  out.stickies = list(out.stickies, s.stickies, l.stickies);
+  for (const k of new Set([...Object.keys(s.answers), ...Object.keys(l.answers)])) {
+    if (same(s.answers[k], l.answers[k])) continue;
+    if (Object.hasOwn(l.answers, k)) out.answers[k] = l.answers[k];
+    else delete out.answers[k];
+  }
+  const added = l.selected.filter((id) => !s.selected.includes(id));
+  out.selected = [...new Set([...out.selected.filter((id) => !s.selected.includes(id) || l.selected.includes(id)), ...added])];
+  if (!same(s.data, l.data)) out.data = l.data;
+  return out;
+}
+
+/** 新版本已經有草稿時，只把 extra 併進去（留言 / 便利貼依 id、作答不蓋掉已經答的、給 Claude 的話接在後面） */
+export function mergeDraft(into, extra) {
+  const d = normalizeDraft(into);
+  const x = normalizeDraft(extra);
+  const addById = (cur, more) => [...cur, ...more.filter((m) => !cur.some((c) => c.id === m.id))];
+  return {
+    ...d,
+    message: isBlank(x.message) ? d.message : (isBlank(d.message) ? x.message : `${d.message}\n\n${x.message}`),
+    comments: addById(d.comments, x.comments),
+    answers: { ...x.answers, ...d.answers },
+    selected: [...new Set([...d.selected, ...x.selected])],
+    stickies: addById(d.stickies, x.stickies),
   };
 }
 
@@ -398,6 +496,19 @@ export function createDraftSaver({
     get status() { return status; },
     get error() { return error; },
     get dirty() { return pending != null || inflight != null; },
+    // 最後存好（或載入）的內容
+    get saved() { return baseline == null ? null : JSON.parse(baseline); },
+
+    // 頁面要卸載了，進行中的那次還沒回來：flush() 要等它回來才送下一次，那時候頁面已經沒了。
+    // 排隊中的內容現在就交給 send（回傳 false = 送不出去，照舊排隊）。→ true = 送了
+    sendPendingNow(send) {
+      if (!inflight || pending == null || pending === baseline) return false;
+      const json = pending;
+      if (send(JSON.parse(json)) === false) return false;
+      clearTimer();
+      pending = null;
+      return true;
+    },
 
     reset(payload) {
       clearTimer();

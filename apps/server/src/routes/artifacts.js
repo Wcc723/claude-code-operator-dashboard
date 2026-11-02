@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import {
-  ARTIFACT_ID_RE, ELEMENT_ID_RE, HTML_FRAME_ID, payloadCounts,
+  ARTIFACT_ID_RE, ELEMENT_ID_RE, HTML_FRAME_ID, payloadCounts, unreadPayload,
 } from '../services/artifact-repo.js';
 import { FRAME_CSP, buildFrameDocument } from '../services/artifact-frame.js';
 import { sanitizeColor } from '../services/colors.js';
@@ -129,6 +129,30 @@ export function artifactsRouter({ repo, notifier, terminal, insights = null }) {
       view,
       draft: draft ? draft.payload : null,
       draft_updated_at: draft ? draft.updated_at : null,
+      // Claude 讀過這一版的草稿沒有（輪詢也走這裡）。標已讀不會改 draft_updated_at
+      draft_read_at: draft ? draft.read_at : null,
+      draft_unread: draft ? draft.unread : false,
+    });
+  }));
+
+  // 某一版的草稿與已讀狀態。unread_payload 只有 Claude 還沒讀過的內容：切到新版本時用它決定要帶什麼過去，
+  // read_payload 是 Claude 上次讀到的內容（帶過去的項目要從舊版本拿掉時，改過的要還原成這一份）
+  router.get('/:id/draft', wrap((req, res) => {
+    const id = req.params.id;
+    const v = parseVersion(req.query.v);
+    if (v === null) return res.status(400).json({ error: 'v 必須是正整數' });
+    const m = repo.getMeta(id);
+    if (!m) return res.status(404).json({ error: '找不到這個 artifact（可能已刪除）' });
+    const version = v ?? m.current_version;
+    const draft = repo.getDraft(id, version);
+    res.json({
+      version,
+      draft: draft ? draft.payload : null,
+      draft_updated_at: draft ? draft.updated_at : null,
+      draft_read_at: draft ? draft.read_at : null,
+      draft_unread: draft ? draft.unread : false,
+      read_payload: draft ? draft.read_payload : null,
+      unread_payload: draft ? unreadPayload(draft.read_payload, draft.payload) : null,
     });
   }));
 
@@ -151,12 +175,22 @@ export function artifactsRouter({ repo, notifier, terminal, insights = null }) {
   }));
 
   // base_updated_at（選填）：上次 GET / PUT 拿到的 draft_updated_at；跟目前存的不同 → 409 { code: 'draft_conflict', draft_updated_at }。
+  // 草稿只存著等 Claude 來讀：這裡不通知 session，也不會往終端機打任何字。
   // 回傳的 kept 是正規化後各類的數量（版本換了、對不上的留言 / 作答會被丟掉，前端可以跟自己送出的比）
   router.put('/:id/draft', wrap((req, res) => {
     const body = req.body && typeof req.body === 'object' ? req.body : {};
     if (!Object.hasOwn(body, 'payload')) return res.status(400).json({ error: 'payload 必填' });
-    const r = repo.saveDraft(req.params.id, body.version, body.payload, { base: draftBase(body) });
-    res.json({ ok: true, updated_at: r.updated_at, kept: payloadCounts(r.payload) });
+    const baseReadAt = body.base_read_at === null || (typeof body.base_read_at === 'string' && body.base_read_at.length <= 64)
+      ? body.base_read_at
+      : undefined;
+    const r = repo.saveDraft(req.params.id, body.version, body.payload, { base: draftBase(body), baseReadAt });
+    res.json({
+      ok: true,
+      updated_at: r.updated_at,
+      kept: payloadCounts(r.payload),
+      draft_read_at: r.read_at,
+      draft_unread: r.unread,
+    });
   }));
 
   router.post('/:id/submissions', wrap(async (req, res) => {

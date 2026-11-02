@@ -563,7 +563,7 @@ node scripts/channel-cli.js status
 CODD 開的 Claude session 會自動掛上 artifact 工具（HTTP MCP `codd-artifacts`，說明見 [README 的 Artifact 段](../README.md#artifacthtml-頁面與設計畫布)），不需要另外安裝。這裡確認它有開起來。
 
 - **需要人類**：開 session、請 Claude 發布、開連結都由人類在瀏覽器做。agent 不要自己開 session，也不要帶 token 呼叫 `/api/mcp`（規則 4）。
-- 前提：上面的 #5、#6 已通過；要收到提交通知，步驟 7 的 hooks 要裝好。
+- 前提：上面的 #5、#6 已通過。hooks（步驟 7）只有「按提交後自動通知 session」才需要；不按提交、開口請 Claude 讀，不需要 hooks。
 
 agent 先在主機上跑（唯讀；不帶 token，所以預期是 401）：
 
@@ -579,7 +579,8 @@ grep -F '[codd-server] artifacts:' ~/Library/Logs/fancy-codd-server.log | tail -
 | A1 | agent | 上面的指令 | `/api/mcp -> 401`、`host token mode 600`；log 那行是 `https://<hostname>/artifacts（MCP on）`（只在本機使用時是 `http://localhost:<PORT>/artifacts`） |
 | A2 | 人類 | 從 CODD 開一個指令是 `claude` 的 session，送：「用 artifact_create 發布一個 html artifact，標題叫『測試』，內容是一個按鈕」 | Claude 直接呼叫工具，終端機沒有跳出權限詢問；回覆一個 `https://<hostname>/artifact/<id>` 連結 |
 | A3 | 人類 | 開那個連結（手機或其他電腦也行） | 登入後看到那個按鈕；側欄 ARTIFACTS 有這一筆，來源是剛才的 session |
-| A4 | 人類（可選） | 在頁面按「留言」、點按鈕寫一句，再按「提交」 | Claude 閒置時，session 出現一行 `[CODD] artifact「測試」(<id>) 收到第 1 次提交…`，Claude 接著呼叫 `artifact_read_submissions`；頁面的「紀錄」顯示「已通知」 |
+| A4 | 人類（可選） | 在頁面按「留言」、點按鈕寫一句，什麼都不按，回 session 說「看一下」 | Claude 呼叫 `artifact_read_submissions`，說得出那句留言；終端機沒有出現 `[CODD]`；頁面頂列「已儲存」旁邊從「未讀」變成「已讀」（最多 20 秒）。再說一次「看一下」，Claude 回沒有新的回覆 |
+| A5 | 人類（可選） | 再留一句，這次按「提交」 | Claude 閒置時，session 出現一行 `[CODD] artifact「測試」(<id>) 收到第 1 次提交…`，Claude 接著呼叫 `artifact_read_submissions`；頁面的「紀錄」顯示「已通知」 |
 
 - **失敗時**：
 
@@ -590,6 +591,7 @@ grep -F '[codd-server] artifacts:' ~/Library/Logs/fancy-codd-server.log | tail -
 | `/api/mcp -> 403` | 請求帶了轉送 header 或不是本機直連，例如 shell 設了 `http_proxy`，curl 經過了 proxy。這個檢查一定要在主機上直接打 `127.0.0.1`（必要時加 `--noproxy '*'`），不要經過 tunnel |
 | Claude 說沒有 `artifact_create` 這類工具 | session 是在 server 更新前開的（重開 session）；project 的指令不是單純的 `claude …`，例如開頭是別的指令、包了一層腳本，或含有 `;`、`&&`、`\|`、`<`、`>`、`#`、`$(`、結尾是 `\`（請人類到 PROJECTS 改成單純的 `claude …`，其他設定放到 project 的 env）；或 `.env` 有 `CODD_ARTIFACTS_MCP=0` |
 | 呼叫 artifact 工具仍然跳出權限詢問 | project 的指令自己已經帶 `--settings`：CODD 為了不蓋掉它，就不加自動允許的設定。請人類在那份 settings 的 `permissions.allow` 加上 `"mcp__codd-artifacts"`，或在詢問時選允許。其他原因：`.env` 有 `CODD_ARTIFACTS_AUTO_ALLOW=0`，或人類的 settings 有 deny 規則 |
+| 說「看一下」，Claude 回沒有新的回覆（或說讀不到），但頁面上明明有留言 | 看頁面頂列：「儲存失敗」就是沒存進去，點一下重試。「已讀」代表 Claude 真的讀過了，請人類叫 Claude 帶 `full: true` 全部重看。Claude 在別的 session 時，要帶 artifact 的 id；只有建立它的 session 才能省略 id、才會標成已讀 |
 | 提交後 session 沒出現 `[CODD]` 那行 | 看頁面「紀錄」的通知狀態。「等 session 閒置」：Claude 正在忙、或停在權限確認或選單，閒置後才會送（最多等 30 分鐘），這是預期行為。Claude 明明閒著卻一直是「等 session 閒置」，最後變成「等太久，沒有通知」：hooks 沒裝或沒作用（回步驟 7，`setup-cli status` 要是 `complete`），CODD 判斷不出 session 狀態就不送；`CODD_ARTIFACT_NOTIFY_UNKNOWN=1` 可以改成照送，但 Claude 停在選單時打進去的字會被當成選擇，要人類自己決定。「session 已結束」：在頁面按「接手…」交給另一個 session。不管哪種，提交都已保存，在 session 裡請 Claude 用 `artifact_read_submissions` 讀即可 |
 | Claude 給的連結是 `http://localhost:…`（而人類要從外面開） | `.env` 沒有 `TUNNEL_HOSTNAME`，也沒有 `CODD_PUBLIC_URL`。用步驟 3 的 `setenv TUNNEL_HOSTNAME "<hostname>"`（或 `setenv CODD_PUBLIC_URL "https://<hostname>"`），請人類同意後重啟。已經給出的連結把前面換成 `https://<hostname>` 就能開，路徑 `/artifact/<id>` 不變 |
 | Claude 給的連結是 `https://codd.example.com/…` | `.env` 的 `TUNNEL_HOSTNAME` 還是範例值（步驟 0 把它當成未設，server 組連結時照用）。對外使用就改成真正的 hostname；只在本機使用就把那行刪掉或註解掉，連結會變成 `http://localhost:<PORT>/…`。改完請人類同意後重啟 |

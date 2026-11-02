@@ -6,7 +6,8 @@
 // 舊版本唯讀（提交 sheet 仍可打開來看當時寫的「給 Claude 的話」）；?v=N 指定版本（沒帶 = 最新）。
 // 草稿的併發：每次 PUT / 提交都帶上次看到的 draft_updated_at（base_updated_at），別的分頁改過或已經提交 → 409，
 // 這裡重新載入那一版的草稿（不會把已提交、已清掉的草稿寫回去）。
-// 看著的版本被 Claude 發了新版：切到最新版時，新版本沒有草稿的話，把這一版的回覆帶過去（carryDraft）。
+// 看著的版本被 Claude 發了新版：切到最新版時，新版本沒有草稿的話，把這一版 Claude 還沒讀過的回覆帶過去（carryDraft），讀過的留在舊版本。
+// 使用者不一定會按提交：Claude 也能直接讀自動存好的草稿，所以頂列要看得出 Claude 讀過目前的內容沒有（已讀 / 未讀）。
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue';
 import { RouterLink, onBeforeRouteLeave, useRoute, useRouter } from 'vue-router';
 import { api } from '../api.js';
@@ -17,8 +18,8 @@ import CommentList from '../components/artifact/CommentList.vue';
 import CommentEditor from '../components/artifact/CommentEditor.vue';
 import SubmitSheet from '../components/artifact/SubmitSheet.vue';
 import {
-  LIMITS, carryDraft, createDraftSaver, emptyPayload, fmtDateTime, isBlank, isEmptyDraft, newCommentId, normalizeDraft,
-  notifyLabel, payloadCounts, pinsFor, pruneForSubmit, relTimeFrom, targetLabel, utf8Bytes,
+  LIMITS, carryDraft, createDraftSaver, emptyPayload, fmtDateTime, isBlank, isEmptyDraft, mergeDraft, newCommentId, noSubmitHint,
+  normalizeDraft, notifyLabel, overlayUnsaved, payloadCounts, pinsFor, pruneForSubmit, relTimeFrom, stripCarried, targetLabel, utf8Bytes,
 } from '../stores/artifact-draft.js';
 import { useSessionsStore } from '../stores/sessions.js';
 
@@ -29,6 +30,8 @@ const sessions = useSessionsStore();
 
 const POLL_MS = 20000;
 const FLUSH_TIMEOUT_MS = 3000;
+// 帶走項目之前最多等多久，讓還在路上的舊版本存檔先到（到了才拿得掉；等不到最多就是 Claude 讀到兩次）
+const SETTLE_WAIT_MS = 15000;
 // keepalive 請求的 body 上限是 64 KiB（瀏覽器限制，算的是 UTF-8 位元組），留一點餘裕
 const KEEPALIVE_MAX = 60000;
 
@@ -47,6 +50,8 @@ const focusId = ref(null);           // 目前聚焦的留言（釘選標記放�
 const hoverId = ref(null);
 const saveStatus = ref('saved');     // 'saved' | 'pending' | 'saving' | 'error'
 const saveError = ref('');
+const draftUnread = ref(false);      // 目前存好的草稿有 Claude 還沒讀過的內容
+const draftReadAt = ref(null);       // Claude 上次讀這份草稿的時間
 const notifyOn = ref(true);
 const submitBusy = ref(false);
 const submitResult = ref(null);
@@ -153,6 +158,25 @@ const saveLabel = computed(() => {
   }
 });
 
+// Claude 讀過目前的內容沒有：只在內容都存好時才說（還在存的話，server 上的還不是畫面上這一份）；沒有內容就不顯示
+const readBadge = computed(() => {
+  if (counts.value.empty) return null;
+  if (!readonly.value && saveStatus.value !== 'saved') return null;
+  if (draftUnread.value) {
+    const how = origin.value?.alive
+      ? '不用提交，回 session 跟 Claude 說一聲就讀得到。'
+      : `${origin.value ? '原本的 session 已經結束' : '這個 artifact 沒有對應的 session'}，${readonly.value ? '切到最新版本按' : '按'}「接手…」交給一個 session 才讀得到。`;
+    return { cls: 'unread', label: '未讀', title: `Claude 還沒讀過目前的內容。${how}` };
+  }
+  // 沒有未讀也沒有讀過 = server 上沒有這些內容（例如帶過來時全部被丟掉）：什麼都不說，不能講成 Claude 讀過
+  if (!draftReadAt.value) return null;
+  return {
+    cls: 'read',
+    label: '已讀',
+    title: `Claude 讀過目前的內容（${fmtDateTime(draftReadAt.value)}）。${readonly.value ? '' : '之後再改會變回未讀。'}`,
+  };
+});
+
 // ───── 手機判斷（編輯浮層 / 面板改成底部 sheet）─────
 const mq = window.matchMedia('(max-width: 767px)');
 const isMobile = ref(mq.matches);
@@ -179,6 +203,9 @@ function makeSaver(id, ver, stamp = null) {
   saver?.dispose();
   const ctx = { id, ver, stamp: typeof stamp === 'string' ? stamp : null, checkKept: false };
   saverCtx = ctx;
+  // 新的 saver 從「已儲存」開始：上一份 saver 的「儲存失敗」「儲存中」不能留在畫面上
+  saveStatus.value = 'saved';
+  saveError.value = '';
   saver = createDraftSaver({
     save: async (payload) => {
       const body = api.artifactDraftBody(ver, payload, ctx.stamp);
@@ -186,10 +213,16 @@ function makeSaver(id, ver, stamp = null) {
       // （只是切到背景的話一般請求也送得完；真的關分頁時 64 KiB 以上本來就沒有辦法送）
       const keepalive = keepaliveNext && utf8Bytes(body) <= KEEPALIVE_MAX;
       const res = await api.saveArtifactDraft(id, ver, payload, { keepalive, body });
-      if (typeof res?.updated_at === 'string') ctx.stamp = res.updated_at;
+      adoptStamp(ctx, res);
+      if (ctx === saverCtx) setReadState(res);
       if (ctx.checkKept) {
         ctx.checkKept = false;
-        if (ctx === saverCtx) reportServerDropped(payload, res?.kept);
+        if (ctx === saverCtx) reportServerDropped(ctx, payload, res?.kept);
+      }
+      if (ctx.carried) {
+        const c = ctx.carried;
+        ctx.carried = null;
+        settleCarried(c);
       }
       return res;
     },
@@ -202,8 +235,20 @@ function makeSaver(id, ver, stamp = null) {
   });
 }
 
-// 帶到新版本的回覆存進去之後，server 正規化時又丟掉的（例如作答的選項在新版本改了）：提示一下
-function reportServerDropped(sent, kept) {
+// stamp 只會往前（卸載前補送的請求可能比進行中的那次先回來）
+function adoptStamp(ctx, res) {
+  const u = res?.updated_at;
+  if (typeof u === 'string' && (!ctx.stamp || u > ctx.stamp)) ctx.stamp = u;
+}
+
+function setReadState(res) {
+  draftUnread.value = !!res?.draft_unread;
+  draftReadAt.value = typeof res?.draft_read_at === 'string' ? res.draft_read_at : null;
+}
+
+// 帶到新版本的回覆存進去之後，server 正規化時又丟掉的（例如作答的選項在新版本改了）：接在原本的提示後面，
+// 全部被丟掉就改口。畫面也要換成 server 實際存的內容，不然提交按鈕的數字與已讀狀態都對不上
+function reportServerDropped(ctx, sent, kept) {
   if (!kept || typeof kept !== 'object') return;
   const n = (v) => (Number.isFinite(v) ? v : 0);
   const lost = [];
@@ -212,7 +257,16 @@ function reportServerDropped(sent, kept) {
   if (Object.keys(sent?.answers ?? {}).length - n(kept.answers) > 0) lost.push(`${Object.keys(sent.answers).length - n(kept.answers)} 題作答`);
   if (d('selected') > 0) lost.push(`${d('selected')} 個「選這個」`);
   if (d('stickies') > 0) lost.push(`${d('stickies')} 張便利貼`);
-  if (lost.length) flash(`新版本對不上的內容沒有帶過去：${lost.join('、')}。`);
+  if (!lost.length) return;
+  const from = ctx.carried?.from ?? ctx.carriedFrom;
+  const keptAny = n(kept.comments) + n(kept.answers) + n(kept.selected) + n(kept.stickies) > 0 || kept.has_message;
+  flash(keptAny
+    ? `${ctx.carryNotice ?? ''}新版本對不上的內容沒有帶過去：${lost.join('、')}（還留在 v${from}，Claude 也讀得到）。`
+    : `v${from} 還沒讀過的回覆對不上新版本（${lost.join('、')}），沒有帶過來；切回 v${from} 還看得到，Claude 也讀得到。`);
+  // 這次存檔的回應處理完才換（saver 還沒把它算成存好）；換的時候使用者又在打字就不動
+  setTimeout(() => {
+    if (ctx === saverCtx && saver && !saver.dirty) reloadDraft({ reason: 'normalized' });
+  }, 0);
 }
 
 // 重新載入這一版的草稿（別的分頁 / 裝置改過、或已經提交清掉了：server 回 409 draft_conflict）。
@@ -227,6 +281,7 @@ function reloadDraft({ reason = 'conflict' } = {}) {
     try {
       const res = await api.getArtifact(ctx.id, { version: ctx.ver });
       if (ctx !== saverCtx || seq !== loadSeq || !res?.artifact) return false;
+      if (reason === 'normalized' && saver?.dirty) return false;
       const d = normalizeDraft(res.draft);
       ctx.stamp = typeof res.draft_updated_at === 'string' ? res.draft_updated_at : null;
       editing.value = null;
@@ -236,6 +291,7 @@ function reloadDraft({ reason = 'conflict' } = {}) {
       data.value = { ...data.value, artifact: res.artifact, versions: res.versions ?? data.value.versions };
       draft.value = d;
       saver?.reset(d);
+      setReadState(res);
       if (reason === 'conflict') flash('這份回覆在別的分頁或裝置改過（或已經提交）了，已載入最新的內容。');
       return true;
     } catch {
@@ -273,18 +329,45 @@ async function load() {
   // 切版本 / 換 artifact：先收掉編輯中的留言，讓 watcher 排進上一份草稿，再把它送出去
   if (editing.value) closeEditor();
   await nextTick();
-  if (saver && !readonly.value) await withTimeout(saver.flush(), FLUSH_TIMEOUT_MS);
+  // 畫面上的內容先留一份：下面的儲存可能失敗或來不及，server 上就不是這一份（重試載入時 saver 已經沒了，沿用第一次留的）
+  if (carry && !carry.local) {
+    carry.local = JSON.parse(JSON.stringify(draft.value));
+    carry.saved = saver?.saved ?? null;
+  }
+  let unsaved = false;
+  if (saver && !readonly.value) {
+    const flushing = saver.flush();
+    await withTimeout(flushing, FLUSH_TIMEOUT_MS);
+    // 409 是別的分頁改過：本來就以 server 為準，其他情況就是還有修改沒存進去
+    unsaved = (saver.dirty || saver.status !== 'saved') && !isDraftConflict(saver.error);
+    if (carry) {
+      carry.unsaved = unsaved;
+      carry.flushing = flushing;
+    }
+  }
   if (seq !== loadSeq) return;
+  const lostEdits = unsaved && !carry;
+  // 要帶回覆到新版本：現在才問 Claude 讀過哪些。Claude 常常讀完、發版之後使用者才切過來，載入頁面時的狀態已經過期
+  if (carry) {
+    let state = null;
+    try { state = await api.getArtifactDraft(carry.id, carry.from); } catch { state = null; }
+    if (seq !== loadSeq) return;
+    carry.state = state;
+  }
   loading.value = true;
   loadError.value = null;
   try {
     const res = await api.getArtifact(id, { version: v });
     if (seq !== loadSeq) return;
     applyLoaded(res);
+    if (lostEdits) flash(UNSAVED_NOTICE);
   } catch (e) {
     if (seq !== loadSeq) return;
-    saver?.dispose();
-    saver = null;
+    // 還有修改沒存進去：saver 留著繼續重試，不然連上線之前關掉這一頁就真的沒了（重試載入時會再 flush 一次）
+    if (e.status === 404 || !saver || (!saver.dirty && saver.status === 'saved')) {
+      saver?.dispose();
+      saver = null;
+    }
     data.value = null;
     loadError.value = { status: e.status ?? 0, message: e.message, version: v };
   } finally {
@@ -292,8 +375,10 @@ async function load() {
   }
 }
 
+const UNSAVED_NOTICE = '剛才最後的修改可能沒存進去（網路太慢或儲存失敗）。切回那個版本確認一下。';
+
 function applyLoaded(res) {
-  const { draft: rawDraft, draft_updated_at: stamp, ...rest } = res ?? {};
+  const { draft: rawDraft, draft_updated_at: stamp, draft_read_at: readAt, draft_unread: unread, ...rest } = res ?? {};
   if (!rest.artifact || !rest.view) throw Object.assign(new Error('server 回應格式不對'), { status: 500 });
   data.value = rest;
   latestVersion.value = rest.artifact.current_version ?? rest.version;
@@ -307,45 +392,124 @@ function applyLoaded(res) {
   const d = normalizeDraft(rawDraft);
   makeSaver(rest.artifact.id ?? props.id, rest.version, stamp);
   saver.reset(d);
+  setReadState({ draft_read_at: readAt, draft_unread: unread });
   draft.value = applyCarry(d, rest);
   if (panel.value === 'history') loadHistory();
 }
 
 // ───── 把舊版本的回覆帶到新版本 ─────
-// 從「被新版本取代、但還沒提交」的那一版切到最新版時記下來；載入新版本後，新版本沒有草稿才帶（有就不動，舊的那一版
-// 還留在 server，切回去看得到）。
-let carry = null; // { id, from, to, payload }
+// 從「被新版本取代」的那一版切到最新版時記下來，load() 再去問 server 哪些是 Claude 還沒讀過的（state，見 getArtifactDraft）。
+// 只帶還沒讀過的：讀過的留在舊版本當紀錄；全部都讀過就什麼都不帶，也不提示。新版本已經有草稿就不動（舊的那一版還留在 server，
+// 切回去看得到，Claude 也讀得到）。
+// 切換當下還沒存進 server 的修改（local、saved、unsaved）一定要有去處：併到帶過去的內容裡，不能跟著舊的 saver 一起消失。
+let carry = null; // { id, from, to, state, local, saved, unsaved, flushing }
 
 function prepareCarry(target) {
   carry = null;
   if (!outdated.value || readonly.value || !data.value || target !== latestVersion.value) return;
-  if (isEmptyDraft(draft.value)) return;
-  carry = { id: artifact.value?.id ?? props.id, from: version.value, to: target, payload: JSON.parse(JSON.stringify(draft.value)) };
+  carry = { id: artifact.value?.id ?? props.id, from: version.value, to: target, state: null, local: null, saved: null, unsaved: false, flushing: null };
 }
 
 function applyCarry(d, res) {
   const c = carry;
   carry = null;
-  if (!c || isOldView.value || res.version <= c.from || (res.artifact.id ?? props.id) !== c.id) return d;
+  if (!c) return d;
+  if (isOldView.value || res.version <= c.from || (res.artifact.id ?? props.id) !== c.id) {
+    if (c.unsaved) flash(UNSAVED_NOTICE);
+    return d;
+  }
+  const st = c.state;
+  // 只有還沒存進去的部分（server 上的內容不論讀過沒都不在裡面）
+  const unsavedOnly = c.unsaved ? overlayUnsaved(emptyPayload(), c.saved, c.local) : emptyPayload();
+  const hasUnsaved = !isEmptyDraft(unsavedOnly);
+  const carryOpts = { kind: res.artifact.kind ?? res.view?.kind, fromVersion: c.from };
+
+  // 問不到 Claude 讀過哪些：存好的先留在舊版本（切回去看得到，Claude 也讀得到），沒存進去的不能留在那裡，一定要帶走
+  if (!st && !hasUnsaved) {
+    if (!isEmptyDraft(c.local)) flash(`沒辦法確認 Claude 讀過哪些，v${c.from} 的回覆先留在 v${c.from}（切回去還看得到，Claude 也讀得到）。`);
+    return d;
+  }
+  const source = st ? (c.unsaved ? overlayUnsaved(st.unread_payload, c.saved, c.local) : st.unread_payload) : unsavedOnly;
+  if (isEmptyDraft(source)) return d;
+
   if (!isEmptyDraft(d)) {
-    flash(`v${res.version} 已經有回覆的草稿，v${c.from} 寫的沒有帶過來（切回 v${c.from} 還看得到）。`);
-    return d;
+    // 新版本已經有草稿：存好的留在舊版本，沒存進去的併過來
+    if (!hasUnsaved) {
+      flash(`v${res.version} 已經有回覆的草稿，v${c.from} 還沒讀過的回覆沒有帶過來（切回 v${c.from} 還看得到，Claude 也讀得到）。`);
+      return d;
+    }
+    const extra = carryDraft(unsavedOnly, res.view, carryOpts).payload;
+    flash(`v${res.version} 已經有回覆的草稿，只把 v${c.from} 最後沒存進去的修改併過來；其他還沒讀過的留在 v${c.from}（Claude 也讀得到）。`);
+    trackCarried(c, res, '');
+    nextTick(() => { saver?.schedule(draft.value); saver?.flush(); });
+    return mergeDraft(d, extra);
   }
-  const r = carryDraft(c.payload, res.view, { kind: res.artifact.kind ?? res.view?.kind });
-  if (isEmptyDraft(r.payload)) {
-    flash(`v${c.from} 的回覆對不上新版本（frame / 題目都換了），沒有帶過來；切回 v${c.from} 還看得到。`);
-    return d;
-  }
+
+  const r = carryDraft(source, res.view, carryOpts);
   const skipped = [];
   if (r.dropped.comments) skipped.push(`${r.dropped.comments} 則留言`);
   if (r.dropped.answers) skipped.push(`${r.dropped.answers} 題作答`);
   if (r.dropped.selected) skipped.push(`${r.dropped.selected} 個「選這個」`);
+  if (r.dropped.stickies) skipped.push(`${r.dropped.stickies} 張便利貼`);
   if (r.dropped.data) skipped.push('頁面送來的資料');
-  flash(`已把 v${c.from} 還沒提交的回覆帶到 v${res.version}。${skipped.length ? `新版本對不上、沒帶過來的：${skipped.join('、')}。` : ''}留言的位置是舊版的，請確認一下。`);
-  // 存進去（watch(draft) 也會排；這裡明確排一次）。server 存的時候又丟掉的（作答選項改了…）在回應的 kept 裡比對
-  if (saverCtx) saverCtx.checkKept = true;
-  nextTick(() => saver?.schedule(draft.value));
+  if (isEmptyDraft(r.payload)) {
+    flash(`v${c.from} 還沒讀過的回覆對不上新版本（${skipped.join('、')}），沒有帶過來；切回 v${c.from} 還看得到，Claude 也讀得到。`);
+    return d;
+  }
+  // 舊版本扣掉帶走的之後，比沒帶走的還多 = 還有 Claude 讀過的留在那裡（讀過的頁面資料也算）
+  let readStays = false;
+  if (st) {
+    const left = payloadCounts(stripCarried(st.draft, st.read_payload, r.payload));
+    const notCarried = r.dropped.comments + r.dropped.answers + r.dropped.selected + r.dropped.stickies + (r.dropped.data ? 1 : 0);
+    readStays = left.items + (left.hasMessage ? 1 : 0) + (left.hasData ? 1 : 0) > notCarried;
+  }
+  const text = `已把 v${c.from} Claude 還沒讀過的回覆帶到 v${res.version}。`
+    + `${st ? '' : `沒辦法確認 Claude 讀過哪些，其他存好的先留在 v${c.from}。`}`
+    + `${readStays ? `讀過的留在 v${c.from}。` : ''}`
+    + `${skipped.length ? `新版本對不上、沒帶過來的：${skipped.join('、')}。` : ''}`
+    + `${r.payload.comments.length ? '留言的位置是舊版的，請確認一下。' : ''}`;
+  flash(text);
+  trackCarried(c, res, text);
+  // 馬上存，不等 debounce：存好才會把帶走的項目從舊版本拿掉，這段空檔裡 Claude 讀的話同一則會在兩個版本各讀到一次。
+  // server 存的時候又丟掉的（作答選項改了…）在回應的 kept 裡比對
+  nextTick(() => { saver?.schedule(draft.value); saver?.flush(); });
   return r.payload;
+}
+
+// 新版本第一次存好時要做的事：比對 server 丟掉了什麼、把帶走的項目從舊版本拿掉
+function trackCarried(c, res, notice) {
+  if (!saverCtx) return;
+  saverCtx.checkKept = true;
+  saverCtx.carryNotice = notice;
+  saverCtx.carriedFrom = c.from;
+  saverCtx.carried = { id: c.id, from: c.from, to: res.version, flushing: c.flushing };
+}
+
+// 新版本存好之後，把帶走的項目從舊版本拿掉，Claude 才不會在兩個版本各讀到一次。
+// 用新版本實際存進去的內容比對（server 可能又丟掉一些，那些要留在舊版本）。
+// 舊版本的內容與已讀狀態一定要這時候才拿：切過來之後 Claude 可能已經讀過（手機上頁面還可能被暫停一陣子），
+// 拿舊的狀態會把 Claude 讀過的項目刪掉，它會以為使用者刪了；讀過的項目要還原，不能拿掉。
+// 失敗也沒關係：最多就是讀到兩次
+async function settleCarried(c) {
+  try {
+    if (c.flushing) await withTimeout(c.flushing, SETTLE_WAIT_MS);
+    const saved = await api.getArtifactDraft(c.id, c.to);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const old = await api.getArtifactDraft(c.id, c.from);
+      if (!old?.draft) return;
+      const next = stripCarried(old.draft, old.read_payload, saved?.draft);
+      if (JSON.stringify(next) === JSON.stringify(normalizeDraft(old.draft))) return;
+      try {
+        // base + baseReadAt：算完到存進去之間又有人改、或 Claude 又讀了，就用最新的狀態重算一次
+        await api.saveArtifactDraft(c.id, c.from, next, { base: old.draft_updated_at, baseReadAt: old.draft_read_at });
+        return;
+      } catch (e) {
+        if (!isDraftConflict(e)) throw e;
+      }
+    }
+  } catch (e) {
+    console.info('[artifact] 舊版本的草稿沒有更新：', e?.message);
+  }
 }
 
 // 離開這一頁時 route 先變（?v 消失）才卸載元件：那一次不要重新載入
@@ -362,11 +526,21 @@ async function poll() {
   polling = true;
   const seq = loadSeq;
   const before = artifact.value;
+  const ctx = saverCtx;
+  const stampAtSend = ctx?.stamp ?? null;
   try {
     const res = await api.getArtifact(props.id, { version: data.value.version });
     if (seq !== loadSeq || !data.value || !res?.artifact) return;
     latestVersion.value = Math.max(latestVersion.value ?? 0, res.artifact.current_version ?? 0);
     data.value = { ...data.value, artifact: res.artifact, versions: res.versions ?? data.value.versions };
+    // 是同一份（標已讀不會改 draft_updated_at）才採用已讀狀態。不是同一份：這段期間這裡存過東西 = 回應比較舊，不理它；
+    // 這裡都沒動 = 別的分頁 / 裝置改過，載入最新的內容（不然這裡的已讀 / 未讀會一直停在舊的）。使用者正在改的話等下一輪
+    const remote = res.draft_updated_at ?? null;
+    if (ctx && ctx === saverCtx) {
+      if (ctx.stamp === remote) setReadState(res);
+      else if (ctx.stamp === stampAtSend && saver && !saver.dirty && saver.status === 'saved'
+        && !editing.value && !submitOpen.value && !submitBusy.value) reloadDraft({ reason: 'conflict' });
+    }
     if (panel.value === 'history' && (res.artifact.submission_count !== before?.submission_count
       || res.artifact.unread_count !== before?.unread_count)) loadHistory();
   } catch (e) {
@@ -560,6 +734,11 @@ function onSubmitData(ev) {
   }
   const d = unwrapData(ev);
   draft.value.data = d === undefined ? null : d;
+  // 使用者不按提交的話，Claude 會直接讀到這份資料，所以要分得出是使用者操作的，還是頁面自己呼叫的（例如一載入就送）。
+  // 使用者點 iframe 時 activation 也會傳到這一層；iframe 裡的 script 假造不了這裡的值。瀏覽器沒有這個 API 就不下判斷
+  const activation = navigator.userActivation;
+  if (activation && !activation.isActive && draft.value.data != null) draft.value.data_origin = 'page';
+  else delete draft.value.data_origin;
   openSubmit();
 }
 
@@ -713,6 +892,7 @@ async function doSubmit() {
     const fresh = emptyPayload();
     draft.value = fresh;
     saver?.reset(fresh);
+    setReadState(null);
     editing.value = null;
     focusId.value = null;
     hoverId.value = null;
@@ -745,7 +925,7 @@ async function doSubmit() {
     submitError.value = {
       status: e.status ?? 0,
       message: e.status === 409
-        ? 'Claude 已經發布新版本，這一版不能再提交。切到最新版本時，還沒提交的回覆會一起帶過去（新版本對不上的除外）。'
+        ? 'Claude 已經發布新版本，這一版不能再提交。切到最新版本時，Claude 還沒讀過的回覆會一起帶過去（新版本對不上的除外）。'
         : e.status === 413
           ? `內容太大，server 拒收：${e.message}`
           : `提交失敗：${e.message}`,
@@ -803,23 +983,52 @@ document.addEventListener('pointerdown', onDocPointerdown, true);
 // ───── 生命週期 ─────
 let clock = null;
 
-function onVisibility() {
-  if (document.hidden) {
-    // 切到背景 / 關分頁：排隊中的草稿立刻送（小的用 keepalive，頁面卸載後也送得出去）
-    if (saver?.dirty && !readonly.value) {
-      keepaliveNext = true;
-      saver.flush().finally(() => { keepaliveNext = false; });
-    }
-  } else {
-    poll();
+// 切到背景 / 關分頁：排隊中的草稿立刻送（小的用 keepalive，頁面卸載後也送得出去）。
+// 使用者常常是切到終端機說「看一下」，這時候內容要已經在 server 上
+function flushNow() {
+  if (saver?.dirty && !readonly.value) {
+    keepaliveNext = true;
+    saver.flush().finally(() => { keepaliveNext = false; });
   }
+}
+
+// 真的要離開頁面了：進行中的存檔還沒回來的話，flush() 要等它回來才送新的內容，那時候頁面已經沒了，所以現在就送。
+// 這一次不帶 base：進行中的那次會改掉 updated_at，帶了一定 409。不管誰先到，最後留下的都是最新的內容
+//（進行中的那次晚到的話，它帶的 base 已經過期，會被 server 拒絕）
+function onPageHide() {
+  const ctx = saverCtx;
+  if (saver && ctx && !readonly.value) {
+    const sent = saver.sendPendingNow((payload) => {
+      const body = api.artifactDraftBody(ctx.ver, payload, undefined);
+      if (utf8Bytes(body) > KEEPALIVE_MAX) return false;
+      api.saveArtifactDraft(ctx.id, ctx.ver, payload, { keepalive: true, body })
+        .then((res) => adoptStamp(ctx, res))
+        .catch(() => {});
+      return true;
+    });
+    if (sent) return;
+  }
+  flushNow();
+}
+
+function onVisibility() {
+  if (document.hidden) flushNow();
+  else poll();
+}
+
+// 網路恢復：不等重試的倒數，馬上把沒存進去的送出去；停在「讀取失敗」的畫面就順便重新載入
+function onOnline() {
+  if (!data.value && loadError.value && loadError.value.status !== 404) load();
+  else if (saver && !readonly.value) saver.flush();
 }
 
 onMounted(() => {
   pollTimer = setInterval(poll, POLL_MS);
   clock = setInterval(() => { now.value = Date.now(); }, 30000);
   document.addEventListener('visibilitychange', onVisibility);
-  window.addEventListener('pagehide', onVisibility);
+  // pagehide 當下 document.hidden 不一定已經是 true（iOS Safari 離開頁面時可能也不會有 visibilitychange）
+  window.addEventListener('pagehide', onPageHide);
+  window.addEventListener('online', onOnline);
   mq.addEventListener?.('change', onMq);
 });
 
@@ -833,7 +1042,8 @@ onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKeydownCapture, true);
   document.removeEventListener('pointerdown', onDocPointerdown, true);
   document.removeEventListener('visibilitychange', onVisibility);
-  window.removeEventListener('pagehide', onVisibility);
+  window.removeEventListener('pagehide', onPageHide);
+  window.removeEventListener('online', onOnline);
   mq.removeEventListener?.('change', onMq);
   clearInterval(pollTimer);
   clearInterval(clock);
@@ -865,7 +1075,7 @@ onBeforeUnmount(() => {
     <template v-else>
       <!-- ───── 頂列 ───── -->
       <header class="av-top">
-        <div class="av-id">
+        <div class="av-id" :class="{ 'has-adopt': !readonly && !origin?.alive }">
           <RouterLink to="/artifacts" class="av-back" aria-label="回 ARTIFACTS 列表" title="回 ARTIFACTS 列表">
             <span aria-hidden="true">←</span><span class="av-back-text">ARTIFACTS</span>
           </RouterLink>
@@ -923,6 +1133,13 @@ onBeforeUnmount(() => {
             @click="retrySave"
           >儲存失敗 ↻</button>
           <span v-else class="av-save" :class="readonly ? 'ro' : saveStatus" role="status" aria-live="polite">{{ saveLabel }}</span>
+          <span
+            v-if="readBadge"
+            class="av-read"
+            :class="readBadge.cls"
+            :title="readBadge.title"
+            :aria-label="readBadge.title"
+          >{{ readBadge.label }}</span>
         </div>
 
         <div class="av-tools" role="toolbar" aria-label="檢視工具">
@@ -981,7 +1198,7 @@ onBeforeUnmount(() => {
         <button type="button" class="av-bbtn" @click="gotoLatest">切到最新 v{{ latestVersion }}</button>
       </div>
       <div v-else-if="outdated" class="av-banner new" role="status">
-        <span>Claude 發布了新版本 v{{ outdated }}<template v-if="latestNote">：{{ latestNote }}</template>。這一版的回覆不能再提交。</span>
+        <span>Claude 發布了新版本 v{{ outdated }}<template v-if="latestNote">：{{ latestNote }}</template>。這一版的回覆不能再提交，但 Claude 還是讀得到。</span>
         <button type="button" class="av-bbtn" @click="gotoLatest">切過去</button>
       </div>
       <div v-if="notice" class="av-banner notice" role="status">
@@ -1071,8 +1288,9 @@ onBeforeUnmount(() => {
               @update-text="updateText"
               @delete="removeComment"
             />
+            <p v-if="panel === 'comments' && !readonly" class="av-pnote av-nosubmit">{{ noSubmitHint(origin) }}</p>
 
-            <div v-else class="av-hist">
+            <div v-if="panel !== 'comments'" class="av-hist">
               <p v-if="history.loading && !history.items.length" class="av-pnote">// loading …</p>
               <p v-else-if="history.error" class="av-perr">讀取失敗：{{ history.error }}
                 <button type="button" class="av-bbtn" @click="loadHistory">重試</button>
@@ -1145,7 +1363,7 @@ onBeforeUnmount(() => {
         :sheet="isMobile"
         @update:message="draft.message = $event"
         @update:notify="notifyOn = $event"
-        @clear-data="draft.data = null"
+        @clear-data="draft.data = null; delete draft.data_origin"
         @submit="doSubmit"
         @close="closeSubmit()"
         @goto-latest="gotoLatest"
@@ -1345,6 +1563,14 @@ button.av-save.error {
 button.av-save.error::before,
 button.av-save.error::after { content: none; }
 button.av-save.error:hover { box-shadow: none; text-decoration: underline; }
+.av-read {
+  flex: none;
+  font-size: 11.5px;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+}
+.av-read.read { color: var(--cyan); }
+.av-read.unread { color: var(--amber); }
 
 .av-tools {
   flex: 0 1 auto;
@@ -1574,6 +1800,7 @@ button.av-save.error:hover { box-shadow: none; text-decoration: underline; }
   font-size: 12.5px;
   color: var(--dimmer);
 }
+.av-nosubmit { margin-top: 12px; line-height: 1.5; }
 .av-perr {
   margin: 4px 0;
   font-size: 12.5px;
@@ -1695,15 +1922,18 @@ button.av-save.error:hover { box-shadow: none; text-decoration: underline; }
   }
   .av-id {
     flex: 1 1 100%;
-    gap: 8px;
+    gap: 6px;
   }
   .av-back { padding: 0 8px; font-size: 18px; }
   .av-back-text { display: none; }
   .av-title { font-size: 15px; flex: 1 1 auto; }
   .av-kind { font-size: 9.5px; letter-spacing: 0.1em; }
-  .av-ver { max-width: 96px; padding-left: 6px; }
+  .av-ver { min-width: 76px; max-width: 96px; padding-left: 6px; }
+  /* 接手… 也要擠在這一列：收掉種類標籤，版本號才不會被切成 v1… */
+  .av-id.has-adopt .av-kind { display: none; }
   .av-origin { display: none; }
   .av-save { margin-left: 0; font-size: 11px; }
+  .av-read { font-size: 11px; letter-spacing: 0; margin-left: -2px; }
   .av-tools { flex: 1 1 100%; gap: 4px; }
   .av-spacer { display: block; flex: 1; }
   .av-mode { padding: 2px 9px; }

@@ -10,7 +10,7 @@
 | 📁 Projects | 開 session 的設定（資料夾 + 指令 + env），可設預設標記色，新開的 session 會繼承 |
 | 🛰️ Station | 常駐 agent 的基地台：Identity / Skills / Agents / Tasks / Memory / Kanban 合在一頁，用分頁切換 |
 | 📊 用量與帳號 | 側欄底部顯示 Claude（cswap）與 Codex 的週用量，可展開看所有帳號並一鍵切換 |
-| 🖼️ Artifacts | Claude 透過 CODD 發布的 HTML 頁面與設計畫布，從 `/artifact/<id>` 開，不受 Claude 帳號切換影響；可留言、作答、貼便利貼、標「選這個」，提交後自動通知原 session |
+| 🖼️ Artifacts | Claude 透過 CODD 發布的 HTML 頁面與設計畫布，從 `/artifact/<id>` 開，不受 Claude 帳號切換影響；可留言、作答、貼便利貼、標「選這個」，回覆自動存好，回 session 說一聲 Claude 就讀得到；也可以按提交，自動通知原 session |
 | 📚 Skills | 列出 `$CHANNEL_PATH/.claude/skills/*/SKILL.md`，可線上編輯 frontmatter + body |
 | 🤖 Agents | 列出 `.claude/agents/*.md`，可編輯 |
 | ⏰ Tasks | 列出 `tasks/*.md`，可編輯 cron / prompt（不重啟 cron） |
@@ -249,10 +249,10 @@ Claude Code 內建的 Artifact 工具發布到 claude.ai，跟著當下登入的
 | Tool | 用途 |
 |---|---|
 | `artifact_create` | 發布新的 artifact：`kind: "html"` 給 `html`，`kind: "canvas"` 給 `canvas`。回傳 `{ id, kind, title, version, url }`，Claude 會把 url 給你。頁面已經寫成檔案時可以用 `html_path`（這個 session 工作目錄底下的 `.html` / `.htm`）代替 `html` |
-| `artifact_update` | 發布新版本（version +1），或只給 `title` 只改名。只能改這個 session 建立的（restart 後接手的 session 也算）。canvas 沒改的 frame 只給 id 就沿用原本的 HTML |
-| `artifact_get` | 讀內容與狀態：指定版本的 HTML 或 canvas、版本列表、提交數、未讀數、你有沒有還沒提交的草稿（`has_draft`） |
-| `artifact_list` | 列出 artifact（新到舊）；`this_session_only: true` 只列這個 session 建立的 |
-| `artifact_read_submissions` | 讀你提交的回饋：每次提交一段 Markdown 摘要，最後附完整 JSON。預設只回未讀的並標成已讀 |
+| `artifact_update` | 發布新版本（version +1），或只給 `title` 只改名。只能改這個 session 建立的（restart 後接手的 session 也算）。canvas 沒改的 frame 只給 id 就沿用原本的 HTML。舊版本有 Claude 還沒讀過的回覆時，另外回 `previous_version_draft` 與 `warning`（讀過的不算） |
+| `artifact_get` | 讀內容與狀態：指定版本的 HTML 或 canvas、版本列表、提交數、未讀數、這個版本有沒有還沒提交的草稿（`has_draft`）、任何版本有沒有 Claude 還沒讀過的回覆（`draft_unread`、`unread_draft_versions`） |
+| `artifact_list` | 列出 artifact（新到舊），含未讀提交數與 `has_unread_draft`；`this_session_only: true` 只列這個 session 建立的 |
+| `artifact_read_submissions` | 一次回答「使用者說了什麼」：未讀的提交，加上每個版本 Claude 還沒讀過的未提交回覆（各標版本）。每段一份 Markdown 摘要，最後附 JSON。`id` 可以省略（這個 session 最近有動靜的 artifact，有未讀內容的優先；host token 一定要給）。預設只回未讀的並標成已讀，`mark_read: false` 只看不標，不是這個 session 建立的 artifact 一律只看不標。未提交的回覆只回新的與改過的，最上面寫自從上次讀取改了什麼（例如「新增留言 2、修改 1、刪除 1」），沒有新東西就只回一句「沒有新的回覆」。`full: true` 全部重看，`include_draft: false` 只看提交，`seq` 只讀某一次提交，`draft_version` 只讀某個版本的未提交回覆（這兩個都要跟 `id` 一起給）。JSON 太長時只回摘要，照回應給的參數帶 `draft_stamp` + `offset` 分段，讀到最後一段才標已讀；摘要夠用的話帶 `ack_draft: true` 直接標已讀，不必讀完 JSON |
 
 HTML 必須自成一體：CSS / JS 內嵌或從 https CDN 載入，不能 fetch / XHR / WebSocket 連網，不能引用相對路徑的資源，也不能用 cookie / localStorage。單一 artifact 預設上限 3 MiB（canvas 算整個 spec 的 JSON），單一 frame 的 HTML 上限 1.5 MiB。
 
@@ -264,15 +264,19 @@ HTML 必須自成一體：CSS / JS 內嵌或從 https CDN 載入，不能 fetch 
    - **問答**（canvas）：直接在問答卡上作答。
    - **便利貼**（canvas）：切到「便利貼」模式，點畫布任意處貼一張，可以拖曳、換色。
    - **選這個**（canvas）：在 frame 標題列按 ★「選這個」，標出喜歡的方案。
-3. 按「提交」，可以附一段「給 Claude 的話」，預設勾選「提交後通知 session」。
-4. CODD 在建立這個 artifact 的 session 終端機打一行固定格式的通知，再按 Enter：
+3. 接下來有兩條路，都可以用：
+
+   **不按提交**：回 session 跟 Claude 說一聲（「看一下」「我回了」「改好了」）就好。回覆停手 0.8 秒就存好，切到別的分頁或 App 時也會立刻存，所以切到終端機開口時內容已經在 server 上。Claude 呼叫 `artifact_read_submissions` 讀目前的內容，連打到一半的留言也讀得到。這條路沒有任何通知：CODD 不會為了草稿往終端機打字，你開口 Claude 才讀。Claude 每次只讀到上次之後新增、改過、刪掉的部分；頁面頂列「已儲存」旁邊會顯示 Claude 讀過目前的內容沒有（已讀 / 未讀，最多 20 秒更新，存檔後也會更新）。
+
+   **按「提交」**：可以附一段「給 Claude 的話」，預設勾選「提交後通知 session」。回覆送出後草稿清空，並留下一筆紀錄，再由下面的第 4 步通知 Claude。
+4. 按了提交時，CODD 在建立這個 artifact 的 session 終端機打一行固定格式的通知，再按 Enter：
 
    ```text
    [CODD] artifact「<標題>」(<id>) 收到第 <n> 次提交，請用 artifact_read_submissions 讀取後依回饋處理。
    ```
 
    只在 session **閒置**時送（CODD 的 hooks 或 Claude Code 自己的 session 紀錄回報 idle）。Claude 忙碌、停在權限確認或選單時先排隊，閒置後才送，免得打進去的字和 Enter 被當成選擇；最多等 30 分鐘。沒裝 hooks、又找不到 session 紀錄時，CODD 判斷不出狀態，預設不送（見下面的 `CODD_ARTIFACT_NOTIFY_UNKNOWN`）。session 已經結束、等太久，或你取消勾選時都不送，但提交一定會保存，Claude 之後用 `artifact_read_submissions` 讀得到。
-5. Claude 呼叫 `artifact_read_submissions` 讀回饋，改完用 `artifact_update` 發新版本。頁面會出現「有新版本」的提示；舊版本變成唯讀、不能再提交，還沒提交的回覆會帶到新版本。
+5. Claude 呼叫 `artifact_read_submissions` 讀回饋，改完用 `artifact_update` 發新版本。頁面會出現「有新版本」的提示；舊版本不能再提交。切到最新版本時，Claude 還沒讀過的回覆會帶過去（frame / 題目在新版本還在的才帶得過去），讀過的留在舊版本當紀錄；全部都讀過就什麼都不帶，也不提示。Claude 發版之後你還留在舊版本的頁面上繼續留言也沒關係，Claude 讀得到，並標明是哪個版本。
 
 頁面上的「紀錄」列出每次提交的通知狀態（已通知 / 等 session 閒置 / session 已結束 / 等太久，沒有通知…）與 Claude 是否已讀。原本的 session 結束後，按頁面上的「接手…」可以把 artifact 交給另一個執行中、掛了 artifact 工具的 Claude session，之後由它改版、收通知。
 
@@ -282,8 +286,9 @@ HTML 必須自成一體：CSS / JS 內嵌或從 https CDN 載入，不能 fetch 
 - 同一份 CSP 設 `connect-src 'none'`、`form-action 'none'`、`frame-src 'none'`：頁面不能連網抓資料，也不能把表單送到外部。
 - 前端只拿 iframe 的 `src`，不拿原始 HTML，也不用 `v-html` 顯示 artifact 的任何字串。
 - `/api/mcp` 不經過 Google 登入，改用 bearer token，而且只接受本機直連：帶 `cf-connecting-ip`、`x-forwarded-for` 這類轉送 header 的請求（經 Cloudflare Tunnel 進來的一定有）一律 403，所以 MCP 永遠不會經由 tunnel 對外。token 不會出現在 log、API 回應或錯誤訊息。
-- 打進終端機的只有上面那行固定格式的通知（標題去掉控制字元、截到 60 字）。你提交的內容不會打進終端機，Claude 只能用工具讀。
-- 任何 session 都能讀所有 artifact；只有建立它的 session（含 restart 後、或用「接手…」接手的）能改版、把提交標成已讀。
+- 打進終端機的只有上面那行固定格式的通知（標題去掉控制字元、截到 60 字），而且只在你按提交時才打。你的回覆不管有沒有提交都不會打進終端機，草稿連通知都沒有，Claude 只能用工具讀。
+- 任何 session 都能讀所有 artifact（包含還沒提交的回覆）；只有建立它的 session（含 restart 後、或用「接手…」接手的）能改版、把回覆標成已讀。
+- 頁面呼叫 `window.codd.submit` 的資料也會進草稿，不提交 Claude 也讀得到。頁面可能從 CDN 載入第三方程式，所以當下沒有使用者操作（例如一載入就送）的資料，Claude 讀到時會標明是頁面自己送的，不是使用者的指示。按了提交就是你看過、決定送出，不再標。
 
 ### 設定（`.env`，皆選填）
 
@@ -310,7 +315,7 @@ claude mcp add --transport http codd-artifacts-host http://127.0.0.1:3000/api/mc
   --header "Authorization: Bearer $(cat "$CODD/apps/server/data/mcp-host-token")"
 ```
 
-- **token 會以明文存進 Claude Code 的設定**（local / user scope 寫在 `~/.claude.json`），能讀那個檔案的程式都拿得到，可以用它在這台主機上建立 artifact、讀所有 artifact 與提交內容。不要用 `-s project`：那會寫進專案的 `.mcp.json`，可能被 commit。`$(cat …)` 的寫法至少不會讓 token 留在 shell history。
+- **token 會以明文存進 Claude Code 的設定**（local / user scope 寫在 `~/.claude.json`），能讀那個檔案的程式都拿得到，可以用它在這台主機上建立 artifact、讀所有 artifact、提交內容與還沒提交的回覆。不要用 `-s project`：那會寫進專案的 `.mcp.json`，可能被 commit。`$(cat …)` 的寫法至少不會讓 token 留在 shell history。
 - 名稱用 `codd-artifacts-host`，跟 CODD 自動掛的 `codd-artifacts` 分開；也不要用 `-s user`，否則 CODD 開的 session 會同時看到兩組工具，用到這組建立的 artifact 就沒有來源 session，收不到提交通知。
 - host token 建立的 artifact 沒有來源 session：提交後不會通知，要自己請 Claude 用 `artifact_read_submissions` 讀；也不能用 `html_path`。host token 只能改它自己建立的 artifact。之後想交給 CODD 開的 session，在頁面按「接手…」。
 - 這種 session 沒有 `--settings` 自動允許，呼叫工具時會出現 Claude Code 的權限詢問。

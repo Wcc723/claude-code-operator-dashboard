@@ -64,7 +64,9 @@ CREATE TABLE IF NOT EXISTS artifact_drafts (
   artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
   version INTEGER NOT NULL,
   payload TEXT NOT NULL,                     -- 正規化後的回覆 payload JSON
-  updated_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,                  -- 也是併發檢查的版本標記：標成已讀不能動它
+  read_payload TEXT,                         -- Claude 上次讀到的 payload（比對出還沒讀的部分）；NULL = 沒讀過
+  read_at TEXT,                              -- Claude 上次讀草稿的時間
   PRIMARY KEY (artifact_id, version)
 );
 
